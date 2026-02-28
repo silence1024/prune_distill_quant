@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -22,7 +23,7 @@ from torch.distributed.fsdp import (
     StateDictType,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
@@ -526,42 +527,96 @@ def main() -> None:
         )
 
     log("[INFO] Building train/eval datasets...")
-    log(
-        "[INFO] Train dataset config: "
-        f"name={args.dataset}, subset={args.dataset_subset}, split={args.train_split}, "
-        f"seq_len={args.seq_len}, max_samples={args.max_train_samples}, "
-        f"streaming={args.dataset_streaming}"
-    )
-    train_ds = build_lm_tensor_dataset(
-        tokenizer=tokenizer,
-        dataset_name=args.dataset,
-        subset=args.dataset_subset,
-        split=args.train_split,
-        seq_len=args.seq_len,
-        max_samples=args.max_train_samples,
-        show_progress=is_main_process,
-        tokenize_batch_size=args.tokenize_batch_size,
-        streaming=args.dataset_streaming,
-    )
-    log(f"[INFO] Train tensor dataset size (chunks): {len(train_ds)}")
-    log(
-        "[INFO] Eval dataset config: "
-        f"name={args.dataset}, subset={args.dataset_subset}, split={args.eval_split}, "
-        f"seq_len={args.seq_len}, max_samples={args.max_eval_samples}, "
-        f"streaming={args.dataset_streaming}"
-    )
-    eval_ds = build_lm_tensor_dataset(
-        tokenizer=tokenizer,
-        dataset_name=args.dataset,
-        subset=args.dataset_subset,
-        split=args.eval_split,
-        seq_len=args.seq_len,
-        max_samples=args.max_eval_samples,
-        show_progress=is_main_process,
-        tokenize_batch_size=args.tokenize_batch_size,
-        streaming=args.dataset_streaming,
-    )
-    log(f"[INFO] Eval tensor dataset size (chunks): {len(eval_ds)}")
+    def build_one_dataset(split: str, max_samples: int, tag: str) -> TensorDataset:
+        log(
+            f"[INFO] {tag} dataset config: "
+            f"name={args.dataset}, subset={args.dataset_subset}, split={split}, "
+            f"seq_len={args.seq_len}, max_samples={max_samples}, "
+            f"streaming={args.dataset_streaming}"
+        )
+        ds = build_lm_tensor_dataset(
+            tokenizer=tokenizer,
+            dataset_name=args.dataset,
+            subset=args.dataset_subset,
+            split=split,
+            seq_len=args.seq_len,
+            max_samples=max_samples,
+            show_progress=is_main_process,
+            tokenize_batch_size=args.tokenize_batch_size,
+            streaming=args.dataset_streaming,
+        )
+        log(f"[INFO] {tag} tensor dataset size (chunks): {len(ds)}")
+        return ds
+
+    def load_cached_input_ids(path: str) -> torch.Tensor:
+        obj = torch.load(path, map_location="cpu")
+        if isinstance(obj, dict) and "input_ids" in obj:
+            obj = obj["input_ids"]
+        if not isinstance(obj, torch.Tensor):
+            raise RuntimeError(f"Unsupported cache object in {path}: type={type(obj)}")
+        return obj
+
+    # FSDP multi-process: avoid N-rank duplicated tokenization work.
+    use_rank0_dataset_cache = args.use_fsdp and world_size > 1
+    if use_rank0_dataset_cache:
+        cache_dir = os.path.join(args.output_dir, "dataset_cache")
+        cache_common = {
+            "dataset": args.dataset,
+            "subset": args.dataset_subset,
+            "seq_len": args.seq_len,
+            "streaming": args.dataset_streaming,
+            "tokenize_batch_size": args.tokenize_batch_size,
+            "tokenizer": args.student_model,
+        }
+
+        def cache_path(split: str, max_samples: int, tag: str) -> str:
+            payload = {
+                **cache_common,
+                "split": split,
+                "max_samples": max_samples,
+                "tag": tag,
+            }
+            key = hashlib.sha1(
+                json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:16]
+            return os.path.join(cache_dir, f"{tag}_{key}.pt")
+
+        train_cache_path = cache_path(args.train_split, args.max_train_samples, "train")
+        eval_cache_path = cache_path(args.eval_split, args.max_eval_samples, "eval")
+
+        if is_main_process:
+            os.makedirs(cache_dir, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
+
+        train_ds: TensorDataset
+        eval_ds: TensorDataset
+        if is_main_process:
+            if os.path.exists(train_cache_path):
+                log(f"[INFO] Loading cached train tokenized tensor: {train_cache_path}")
+                train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
+            else:
+                train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
+                torch.save(train_ds.tensors[0], train_cache_path)
+                log(f"[INFO] Saved train tokenized cache: {train_cache_path}")
+
+            if os.path.exists(eval_cache_path):
+                log(f"[INFO] Loading cached eval tokenized tensor: {eval_cache_path}")
+                eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
+            else:
+                eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
+                torch.save(eval_ds.tensors[0], eval_cache_path)
+                log(f"[INFO] Saved eval tokenized cache: {eval_cache_path}")
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        if not is_main_process:
+            train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
+            eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
+    else:
+        train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
+        eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
 
     train_sampler = None
     eval_sampler = None
