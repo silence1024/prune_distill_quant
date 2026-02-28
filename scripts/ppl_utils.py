@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import math
+import re
 from typing import Tuple
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
+from datasets import load_dataset, load_dataset_builder
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -12,6 +13,84 @@ from transformers import AutoTokenizer
 
 def loss_to_ppl(loss: float) -> float:
     return math.exp(min(loss, 50.0))
+
+
+def _normalize_subset(subset: str | None) -> str | None:
+    subset_norm = subset
+    if subset_norm is not None and str(subset_norm).strip().lower() in {"", "none", "null"}:
+        subset_norm = None
+    return subset_norm
+
+
+def _load_dataset_split(
+    dataset_name: str,
+    subset_norm: str | None,
+    split: str,
+    streaming: bool,
+):
+    if not streaming:
+        if subset_norm is None:
+            return load_dataset(dataset_name, split=split, streaming=False)
+        return load_dataset(dataset_name, subset_norm, split=split, streaming=False)
+
+    # Streaming backend may reject split slicing like train[:99%], so resolve via skip/take.
+    split_norm = split.strip()
+    m = re.match(r"^([^\[\]]+)\[([^\[\]]+)\]$", split_norm)
+    if m is None:
+        if subset_norm is None:
+            return load_dataset(dataset_name, split=split_norm, streaming=True)
+        return load_dataset(dataset_name, subset_norm, split=split_norm, streaming=True)
+
+    base_split = m.group(1).strip()
+    slice_expr = m.group(2).strip()
+    if ":" not in slice_expr:
+        raise ValueError(
+            f"Unsupported split expression for streaming: `{split}`. Expected forms like "
+            "`train[:99%]`, `train[99%:]`, or `train[1000:2000]`."
+        )
+
+    if subset_norm is None:
+        builder = load_dataset_builder(dataset_name)
+    else:
+        builder = load_dataset_builder(dataset_name, subset_norm)
+    split_info = builder.info.splits.get(base_split)
+    if split_info is None:
+        raise ValueError(
+            f"Bad split: {split}. Available splits: {list(builder.info.splits.keys())}"
+        )
+    total_rows = split_info.num_examples
+    if total_rows is None:
+        raise ValueError(
+            "Unable to resolve streaming split slice because total row count is unknown "
+            f"for split `{base_split}`."
+        )
+
+    def parse_bound(spec: str, default: int) -> int:
+        token = spec.strip()
+        if token == "":
+            return default
+        if token.endswith("%"):
+            ratio = float(token[:-1]) / 100.0
+            return int(total_rows * ratio)
+        return int(token)
+
+    left_spec, right_spec = slice_expr.split(":", 1)
+    start = parse_bound(left_spec, 0)
+    end = parse_bound(right_spec, int(total_rows))
+    start = max(0, min(int(total_rows), start))
+    end = max(0, min(int(total_rows), end))
+    if end < start:
+        raise ValueError(f"Invalid split slice `{split}`: end < start.")
+
+    if subset_norm is None:
+        ds = load_dataset(dataset_name, split=base_split, streaming=True)
+    else:
+        ds = load_dataset(dataset_name, subset_norm, split=base_split, streaming=True)
+    if start > 0:
+        ds = ds.skip(start)
+    if end - start >= 0:
+        ds = ds.take(end - start)
+    return ds
 
 
 def build_lm_tensor_dataset(
@@ -25,13 +104,13 @@ def build_lm_tensor_dataset(
     tokenize_batch_size: int = 512,
     streaming: bool = False,
 ) -> TensorDataset:
-    subset_norm = subset
-    if subset_norm is not None and str(subset_norm).strip().lower() in {"", "none", "null"}:
-        subset_norm = None
-    if subset_norm is None:
-        ds = load_dataset(dataset_name, split=split, streaming=streaming)
-    else:
-        ds = load_dataset(dataset_name, subset_norm, split=split, streaming=streaming)
+    subset_norm = _normalize_subset(subset)
+    ds = _load_dataset_split(
+        dataset_name=dataset_name,
+        subset_norm=subset_norm,
+        split=split,
+        streaming=streaming,
+    )
 
     column_names = getattr(ds, "column_names", None) or []
     if "text" not in column_names:
