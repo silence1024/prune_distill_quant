@@ -17,12 +17,18 @@ def loss_to_ppl(loss: float) -> float:
 def build_lm_tensor_dataset(
     tokenizer: AutoTokenizer,
     dataset_name: str,
-    subset: str,
+    subset: str | None,
     split: str,
     seq_len: int,
     max_samples: int,
 ) -> TensorDataset:
-    ds = load_dataset(dataset_name, subset, split=split)
+    subset_norm = subset
+    if subset_norm is not None and str(subset_norm).strip().lower() in {"", "none", "null"}:
+        subset_norm = None
+    if subset_norm is None:
+        ds = load_dataset(dataset_name, split=split)
+    else:
+        ds = load_dataset(dataset_name, subset_norm, split=split)
     text = "\n\n".join([t for t in ds["text"] if t and not t.isspace()])
     ids = tokenizer(text, return_tensors="pt").input_ids[0]
 

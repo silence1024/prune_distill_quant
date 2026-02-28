@@ -64,6 +64,12 @@ BATCH_SIZE=1 \
 GRAD_ACCUM=8 \
 LR=2e-5 \
 DTYPE=float16 \
+DISTILL_DATASET=wikitext \
+DISTILL_DATASET_SUBSET=wikitext-2-raw-v1 \
+DISTILL_TRAIN_SPLIT=train \
+DISTILL_EVAL_SPLIT=validation \
+DISTILL_MAX_TRAIN_SAMPLES=4000 \
+DISTILL_MAX_EVAL_SAMPLES=400 \
 SPARSE_CHECK_EPS=0.0 \
 FAIL_ON_SPARSE_VIOLATION=1 \
 USE_WANDB=1 \
@@ -191,3 +197,4 @@ python scripts/quantize_model.py \
 - FSDP path requires multi-process launch (`torchrun` or `accelerate launch`) and CUDA.
 - Finetune ends with a sparse integrity check, saved as `sparse_integrity_check` in `distill_stats.json`.
 - `run_pipeline.sh` enables wandb by default (`USE_WANDB=1`) and default `WANDB_RUN_NAME=prune_dist_quant`.
+- Distill dataset in `run_pipeline.sh` is now configurable via: `DISTILL_DATASET`, `DISTILL_DATASET_SUBSET`, `DISTILL_TRAIN_SPLIT`, `DISTILL_EVAL_SPLIT`, `DISTILL_MAX_TRAIN_SAMPLES`, `DISTILL_MAX_EVAL_SAMPLES`.
