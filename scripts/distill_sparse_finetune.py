@@ -160,6 +160,12 @@ def apply_masks_and_freeze(
         normalized = normalize_param_name(name)
         if normalized in mask_dict:
             mask = mask_dict[normalized].to(device=param.device, dtype=param.dtype)
+            if tuple(param.shape) != tuple(mask.shape):
+                raise RuntimeError(
+                    "Mask shape mismatch for parameter "
+                    f"`{normalized}`: param_shape={tuple(param.shape)} "
+                    f"mask_shape={tuple(mask.shape)}"
+                )
             param.requires_grad = True
             with torch.no_grad():
                 param.mul_(mask)
@@ -331,6 +337,13 @@ def main() -> None:
     ).to(device)
     student.train()
 
+    log(f"[INFO] Loading mask file: {args.mask_file}")
+    mask_dict: Dict[str, torch.Tensor] = torch.load(args.mask_file, map_location="cpu")
+    # IMPORTANT: apply mask before wrapping in FSDP/DeepSpeed so mask shape matches original params.
+    trainable_masks = apply_masks_and_freeze(student, mask_dict)
+    log(f"[INFO] Trainable sparse weights: {masked_weight_count(trainable_masks):,}")
+    log(f"[INFO] Masked parameter tensors: {len(trainable_masks)}")
+
     student_train_model: nn.Module = student
     if args.use_fsdp:
         auto_wrap = partial(
@@ -360,12 +373,6 @@ def main() -> None:
             f"sharding={args.fsdp_sharding_strategy}, "
             f"min_num_params={args.fsdp_min_num_params}"
         )
-
-    log(f"[INFO] Loading mask file: {args.mask_file}")
-    mask_dict: Dict[str, torch.Tensor] = torch.load(args.mask_file, map_location="cpu")
-    trainable_masks = apply_masks_and_freeze(student_train_model, mask_dict)
-    log(f"[INFO] Trainable sparse weights: {masked_weight_count(trainable_masks):,}")
-    log(f"[INFO] Masked parameter tensors: {len(trainable_masks)}")
 
     log("[INFO] Building train/eval datasets...")
     train_ds = build_lm_tensor_dataset(
@@ -552,7 +559,8 @@ def main() -> None:
                     optimizer.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
-                    enforce_sparse_masks(mask_target_model, trainable_masks)
+                    if not args.use_fsdp:
+                        enforce_sparse_masks(mask_target_model, trainable_masks)
 
                 global_step += 1
 
@@ -603,7 +611,8 @@ def main() -> None:
         log(f"[PPL] epoch={epoch + 1} eval_loss={eval_loss:.4f} eval_ppl={eval_ppl:.4f}")
 
     with torch.no_grad():
-        enforce_sparse_masks(mask_target_model, trainable_masks)
+        if not args.use_fsdp:
+            enforce_sparse_masks(mask_target_model, trainable_masks)
 
     # Save final model and keep one full state_dict on main rank for stats in FSDP mode.
     full_state_dict = None
@@ -616,6 +625,16 @@ def main() -> None:
             full_cfg,
         ):
             full_state_dict = fsdp_model.state_dict()
+        if is_main_process:
+            # Re-enforce mask on full params before saving/checking.
+            for name, mask in trainable_masks.items():
+                if name in full_state_dict:
+                    full_state_dict[name].mul_(
+                        mask.to(
+                            device=full_state_dict[name].device,
+                            dtype=full_state_dict[name].dtype,
+                        )
+                    )
         if is_main_process:
             fsdp_model.module.save_pretrained(args.output_dir, state_dict=full_state_dict)
             tokenizer.save_pretrained(args.output_dir)
