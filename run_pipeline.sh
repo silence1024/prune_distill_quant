@@ -14,7 +14,11 @@ EPOCHS="${EPOCHS:-3}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 LR="${LR:-2e-5}"
+EMBED_HEAD_LR_RATIO="${EMBED_HEAD_LR_RATIO:-0.2}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.02}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 DTYPE="${DTYPE:-bfloat16}"
+FULL_FINETUNE="${FULL_FINETUNE:-1}"  # 1|0
 # Distill dataset options
 DISTILL_DATASET="${DISTILL_DATASET:-wikitext}"
 DISTILL_DATASET_SUBSET="${DISTILL_DATASET_SUBSET:-wikitext-2-raw-v1}"
@@ -22,6 +26,7 @@ DISTILL_TRAIN_SPLIT="${DISTILL_TRAIN_SPLIT:-train[:99%]}"
 DISTILL_EVAL_SPLIT="${DISTILL_EVAL_SPLIT:-train[99%:]}"
 DISTILL_MAX_TRAIN_SAMPLES="${DISTILL_MAX_TRAIN_SAMPLES:-4000}"
 DISTILL_MAX_EVAL_SAMPLES="${DISTILL_MAX_EVAL_SAMPLES:-400}"
+DISTILL_TOKENIZE_BATCH_SIZE="${DISTILL_TOKENIZE_BATCH_SIZE:-512}"
 DISTILL_BACKEND="${DISTILL_BACKEND:-none}"  # none|deepspeed|fsdp
 DISTILL_LAUNCHER="${DISTILL_LAUNCHER:-python}"  # python|torchrun|accelerate
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-configs/deepspeed_zero2.json}"
@@ -63,17 +68,25 @@ DISTILL_CMD=(
   --eval_split "${DISTILL_EVAL_SPLIT}"
   --max_train_samples "${DISTILL_MAX_TRAIN_SAMPLES}"
   --max_eval_samples "${DISTILL_MAX_EVAL_SAMPLES}"
+  --tokenize_batch_size "${DISTILL_TOKENIZE_BATCH_SIZE}"
   --seq_len "${SEQ_LEN}"
   --epochs "${EPOCHS}"
   --batch_size "${BATCH_SIZE}"
   --grad_accum_steps "${GRAD_ACCUM}"
   --lr "${LR}"
+  --embed_head_lr_ratio "${EMBED_HEAD_LR_RATIO}"
+  --warmup_ratio "${WARMUP_RATIO}"
+  --weight_decay "${WEIGHT_DECAY}"
   --dtype "${DTYPE}"
   --sparse_check_eps "${SPARSE_CHECK_EPS}"
 )
 
 if [[ "${FAIL_ON_SPARSE_VIOLATION}" == "1" ]]; then
   DISTILL_CMD+=(--fail_on_sparse_violation)
+fi
+
+if [[ "${FULL_FINETUNE}" == "1" ]]; then
+  DISTILL_CMD+=(--full_finetune)
 fi
 
 if [[ "${USE_WANDB}" == "1" ]]; then

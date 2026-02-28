@@ -21,6 +21,8 @@ def build_lm_tensor_dataset(
     split: str,
     seq_len: int,
     max_samples: int,
+    show_progress: bool = True,
+    tokenize_batch_size: int = 512,
 ) -> TensorDataset:
     subset_norm = subset
     if subset_norm is not None and str(subset_norm).strip().lower() in {"", "none", "null"}:
@@ -29,16 +31,62 @@ def build_lm_tensor_dataset(
         ds = load_dataset(dataset_name, split=split)
     else:
         ds = load_dataset(dataset_name, subset_norm, split=split)
-    text = "\n\n".join([t for t in ds["text"] if t and not t.isspace()])
-    ids = tokenizer(text, return_tensors="pt").input_ids[0]
 
-    num_chunks = ids.numel() // seq_len
+    if "text" not in ds.column_names:
+        raise ValueError(
+            f"Dataset `{dataset_name}` split `{split}` has no `text` column. "
+            f"Available columns: {list(ds.column_names)}"
+        )
+
+    target_tokens = max_samples * seq_len if max_samples > 0 else None
+    eos_id = tokenizer.eos_token_id
+    token_buffer: list[int] = []
+
+    if tokenize_batch_size <= 0:
+        raise ValueError("--tokenize_batch_size must be > 0.")
+
+    total_rows = len(ds)
+    row_iter = range(0, total_rows, tokenize_batch_size)
+    pbar = tqdm(
+        row_iter,
+        desc=f"Tokenizing {dataset_name}:{split}",
+        disable=not show_progress,
+    )
+    for start in pbar:
+        end = min(start + tokenize_batch_size, total_rows)
+        batch_texts = ds[start:end]["text"]
+        batch_texts = [t for t in batch_texts if isinstance(t, str) and t.strip()]
+        if not batch_texts:
+            continue
+
+        encoded = tokenizer(
+            batch_texts,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            truncation=False,
+        )
+        for ids in encoded["input_ids"]:
+            if not ids:
+                continue
+            token_buffer.extend(ids)
+            if eos_id is not None:
+                token_buffer.append(eos_id)
+
+            if target_tokens is not None and len(token_buffer) >= target_tokens:
+                break
+        if target_tokens is not None and len(token_buffer) >= target_tokens:
+            break
+
+    token_count = len(token_buffer)
+    num_chunks = token_count // seq_len
     if num_chunks == 0:
         raise ValueError(f"Not enough tokens to create sequence length {seq_len}.")
     if max_samples > 0:
         num_chunks = min(num_chunks, max_samples)
 
-    ids = ids[: num_chunks * seq_len].reshape(num_chunks, seq_len)
+    ids = torch.tensor(token_buffer[: num_chunks * seq_len], dtype=torch.long).reshape(
+        num_chunks, seq_len
+    )
     return TensorDataset(ids)
 
 

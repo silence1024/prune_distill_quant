@@ -63,6 +63,10 @@ EPOCHS=1 \
 BATCH_SIZE=1 \
 GRAD_ACCUM=8 \
 LR=2e-5 \
+FULL_FINETUNE=1 \
+EMBED_HEAD_LR_RATIO=0.2 \
+WARMUP_RATIO=0.02 \
+WEIGHT_DECAY=0.05 \
 DTYPE=float16 \
 DISTILL_DATASET=wikitext \
 DISTILL_DATASET_SUBSET=wikitext-2-raw-v1 \
@@ -130,6 +134,10 @@ python scripts/distill_sparse_finetune.py \
   --epochs 1 \
   --batch_size 1 \
   --grad_accum_steps 8 \
+  --full_finetune \
+  --embed_head_lr_ratio 0.2 \
+  --warmup_ratio 0.02 \
+  --weight_decay 0.05 \
   --use_wandb \
   --wandb_project prune_dist_quant \
   --wandb_run_name prune_dist_quant \
@@ -198,3 +206,4 @@ python scripts/quantize_model.py \
 - Finetune ends with a sparse integrity check, saved as `sparse_integrity_check` in `distill_stats.json`.
 - `run_pipeline.sh` enables wandb by default (`USE_WANDB=1`) and default `WANDB_RUN_NAME=prune_dist_quant`.
 - Distill dataset in `run_pipeline.sh` is now configurable via: `DISTILL_DATASET`, `DISTILL_DATASET_SUBSET`, `DISTILL_TRAIN_SPLIT`, `DISTILL_EVAL_SPLIT`, `DISTILL_MAX_TRAIN_SAMPLES`, `DISTILL_MAX_EVAL_SAMPLES`.
+- Full finetune with differential LR is supported: `FULL_FINETUNE=1`, `EMBED_HEAD_LR_RATIO` (recommended `0.1~0.3`), `WARMUP_RATIO` (recommended `0.01~0.03`), `WEIGHT_DECAY`.

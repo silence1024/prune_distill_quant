@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--eval_split", type=str, default="validation")
     parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--tokenize_batch_size", type=int, default=512)
     parser.add_argument("--max_train_samples", type=int, default=4000)
     parser.add_argument("--max_eval_samples", type=int, default=400)
     parser.add_argument("--epochs", type=int, default=1)
@@ -53,12 +54,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--embed_head_lr_ratio",
+        type=float,
+        default=0.2,
+        help="LR multiplier for embedding and lm_head params (recommended 0.1~0.3).",
+    )
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--warmup_ratio", type=float, default=0.02)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--alpha_kd", type=float, default=0.7)
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument(
+        "--full_finetune",
+        action="store_true",
+        help="Train all parameters (instead of sparse-mask-only training).",
+    )
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="prune_dist_quant")
     parser.add_argument("--wandb_run_name", type=str, default="prune_dist_quant")
@@ -206,6 +218,90 @@ def masked_weight_count(trainable_masks: Dict[str, torch.Tensor]) -> int:
     return total
 
 
+def is_embed_or_lm_head_param(name: str) -> bool:
+    n = normalize_param_name(name).lower()
+    keys = (
+        "embed_tokens",
+        "word_embeddings",
+        "tok_embeddings",
+        "token_embedding",
+        "wte",
+        "lm_head",
+        "output_projection",
+    )
+    return any(k in n for k in keys)
+
+
+def is_no_decay_param(name: str) -> bool:
+    n = normalize_param_name(name).lower()
+    if n.endswith("bias"):
+        return True
+    norm_keys = ("norm", "layernorm", "rmsnorm", "ln_")
+    return any(k in n for k in norm_keys)
+
+
+def build_optimizer_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    embed_head_lr_ratio: float,
+    weight_decay: float,
+) -> Tuple[list, list, Dict[str, Dict[str, float]]]:
+    group_cfg = {
+        "embed_head_decay": {
+            "params": [],
+            "lr": base_lr * embed_head_lr_ratio,
+            "weight_decay": weight_decay,
+        },
+        "embed_head_no_decay": {
+            "params": [],
+            "lr": base_lr * embed_head_lr_ratio,
+            "weight_decay": 0.0,
+        },
+        "base_decay": {
+            "params": [],
+            "lr": base_lr,
+            "weight_decay": weight_decay,
+        },
+        "base_no_decay": {
+            "params": [],
+            "lr": base_lr,
+            "weight_decay": 0.0,
+        },
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        embed_or_head = is_embed_or_lm_head_param(name)
+        no_decay = is_no_decay_param(name)
+        if embed_or_head and no_decay:
+            group_cfg["embed_head_no_decay"]["params"].append(param)
+        elif embed_or_head and not no_decay:
+            group_cfg["embed_head_decay"]["params"].append(param)
+        elif not embed_or_head and no_decay:
+            group_cfg["base_no_decay"]["params"].append(param)
+        else:
+            group_cfg["base_decay"]["params"].append(param)
+
+    param_groups = []
+    summary = {}
+    trainable_params = []
+    for k, g in group_cfg.items():
+        if not g["params"]:
+            continue
+        param_groups.append(g)
+        trainable_params.extend(g["params"])
+        summary[k] = {
+            "lr": float(g["lr"]),
+            "weight_decay": float(g["weight_decay"]),
+            "num_tensors": len(g["params"]),
+        }
+
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters found for optimizer.")
+    return param_groups, trainable_params, summary
+
+
 def run_sparse_integrity_check(
     state_tensors: Dict[str, torch.Tensor],
     trainable_masks: Dict[str, torch.Tensor],
@@ -275,6 +371,11 @@ def fsdp_sharding_strategy_from_str(name: str) -> ShardingStrategy:
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.embed_head_lr_ratio <= 0:
+        raise ValueError("--embed_head_lr_ratio must be > 0.")
+    if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
+        raise ValueError("--warmup_ratio must be in [0, 1).")
 
     if args.use_deepspeed and args.use_fsdp:
         raise ValueError("Choose only one backend: --use_deepspeed or --use_fsdp.")
@@ -369,12 +470,20 @@ def main() -> None:
     ).to(device)
     student.train()
 
-    log(f"[INFO] Loading mask file: {args.mask_file}")
-    mask_dict: Dict[str, torch.Tensor] = torch.load(args.mask_file, map_location="cpu")
-    # IMPORTANT: apply mask before wrapping in FSDP/DeepSpeed so mask shape matches original params.
-    trainable_masks = apply_masks_and_freeze(student, mask_dict)
-    log(f"[INFO] Trainable sparse weights: {masked_weight_count(trainable_masks):,}")
-    log(f"[INFO] Masked parameter tensors: {len(trainable_masks)}")
+    sparse_mode = not args.full_finetune
+    mask_dict: Dict[str, torch.Tensor] = {}
+    trainable_masks: Dict[str, torch.Tensor] = {}
+    if sparse_mode:
+        log(f"[INFO] Loading mask file: {args.mask_file}")
+        mask_dict = torch.load(args.mask_file, map_location="cpu")
+        # IMPORTANT: apply mask before wrapping in FSDP/DeepSpeed so mask shape matches original params.
+        trainable_masks = apply_masks_and_freeze(student, mask_dict)
+        log(f"[INFO] Trainable sparse weights: {masked_weight_count(trainable_masks):,}")
+        log(f"[INFO] Masked parameter tensors: {len(trainable_masks)}")
+    else:
+        for p in student.parameters():
+            p.requires_grad = True
+        log("[INFO] Full finetune mode enabled: all parameters are trainable.")
 
     student_train_model: nn.Module = student
     if args.use_fsdp:
@@ -407,6 +516,11 @@ def main() -> None:
         )
 
     log("[INFO] Building train/eval datasets...")
+    log(
+        "[INFO] Train dataset config: "
+        f"name={args.dataset}, subset={args.dataset_subset}, split={args.train_split}, "
+        f"seq_len={args.seq_len}, max_samples={args.max_train_samples}"
+    )
     train_ds = build_lm_tensor_dataset(
         tokenizer=tokenizer,
         dataset_name=args.dataset,
@@ -414,6 +528,14 @@ def main() -> None:
         split=args.train_split,
         seq_len=args.seq_len,
         max_samples=args.max_train_samples,
+        show_progress=is_main_process,
+        tokenize_batch_size=args.tokenize_batch_size,
+    )
+    log(f"[INFO] Train tensor dataset size (chunks): {len(train_ds)}")
+    log(
+        "[INFO] Eval dataset config: "
+        f"name={args.dataset}, subset={args.dataset_subset}, split={args.eval_split}, "
+        f"seq_len={args.seq_len}, max_samples={args.max_eval_samples}"
     )
     eval_ds = build_lm_tensor_dataset(
         tokenizer=tokenizer,
@@ -422,7 +544,10 @@ def main() -> None:
         split=args.eval_split,
         seq_len=args.seq_len,
         max_samples=args.max_eval_samples,
+        show_progress=is_main_process,
+        tokenize_batch_size=args.tokenize_batch_size,
     )
+    log(f"[INFO] Eval tensor dataset size (chunks): {len(eval_ds)}")
 
     train_sampler = None
     eval_sampler = None
@@ -449,12 +574,20 @@ def main() -> None:
         drop_last=False,
     )
 
-    trainable_params = [p for p in student_train_model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
+    optimizer_param_groups, trainable_params, optim_group_summary = build_optimizer_param_groups(
+        model=student_train_model,
+        base_lr=args.lr,
+        embed_head_lr_ratio=args.embed_head_lr_ratio,
         weight_decay=args.weight_decay,
     )
+    optimizer = torch.optim.AdamW(
+        optimizer_param_groups,
+    )
+    for group_name, g in optim_group_summary.items():
+        log(
+            f"[INFO] Optimizer group={group_name} lr={g['lr']:.3e} "
+            f"wd={g['weight_decay']:.3e} tensors={int(g['num_tensors'])}"
+        )
 
     total_update_steps = math.ceil(len(train_loader) / args.grad_accum_steps) * args.epochs
     warmup_steps = int(total_update_steps * args.warmup_ratio)
@@ -601,8 +734,18 @@ def main() -> None:
                     optimizer.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
-                    if not args.use_fsdp:
-                        enforce_sparse_masks(mask_target_model, trainable_masks)
+                    if sparse_mode:
+                        if args.use_fsdp:
+                            # FSDP keeps params sharded/flattened in normal mode.
+                            # Summon full params to enforce the exact sparse mask every step.
+                            with FSDP.summon_full_params(
+                                mask_target_model,
+                                recurse=True,
+                                writeback=True,
+                            ):
+                                enforce_sparse_masks(mask_target_model, trainable_masks)
+                        else:
+                            enforce_sparse_masks(mask_target_model, trainable_masks)
 
                 global_step += 1
 
@@ -676,8 +819,16 @@ def main() -> None:
             )
 
     with torch.no_grad():
-        if not args.use_fsdp:
-            enforce_sparse_masks(mask_target_model, trainable_masks)
+        if sparse_mode:
+            if args.use_fsdp:
+                with FSDP.summon_full_params(
+                    mask_target_model,
+                    recurse=True,
+                    writeback=True,
+                ):
+                    enforce_sparse_masks(mask_target_model, trainable_masks)
+            else:
+                enforce_sparse_masks(mask_target_model, trainable_masks)
 
     # Save final model and keep one full state_dict on main rank for stats in FSDP mode.
     full_state_dict = None
@@ -690,7 +841,7 @@ def main() -> None:
             full_cfg,
         ):
             full_state_dict = fsdp_model.state_dict()
-        if is_main_process:
+        if is_main_process and sparse_mode:
             # Re-enforce mask on full params before saving/checking.
             for name, mask in trainable_masks.items():
                 if name in full_state_dict:
@@ -713,15 +864,17 @@ def main() -> None:
         dist.barrier()
 
     if is_main_process:
-        out_mask = os.path.join(args.output_dir, "sparsity_mask.pt")
-        torch.save(mask_dict, out_mask)
+        out_mask = None
+        if sparse_mode:
+            out_mask = os.path.join(args.output_dir, "sparsity_mask.pt")
+            torch.save(mask_dict, out_mask)
 
         final_stats = {}
         total = 0
         total_nonzero = 0
-        sparse_check = {}
+        sparse_check = None
 
-        if args.use_fsdp:
+        if sparse_mode and args.use_fsdp:
             if full_state_dict is None:
                 raise RuntimeError("Expected FSDP full state_dict on main process.")
             for name, mask in trainable_masks.items():
@@ -742,7 +895,7 @@ def main() -> None:
                 trainable_masks=trainable_masks,
                 eps=args.sparse_check_eps,
             )
-        else:
+        elif sparse_mode:
             stats_model = student_engine.module if use_deepspeed else train_model
             param_lookup = build_param_lookup(stats_model)
             with torch.no_grad():
@@ -765,43 +918,48 @@ def main() -> None:
                 eps=args.sparse_check_eps,
             )
 
-        if sparse_check.get("passed", False):
-            log(
-                "[CHECK] Sparse integrity PASS: "
-                f"violations_outside_mask={sparse_check['total_violations_outside_mask']}, "
-                f"checked_params={sparse_check['checked_param_count']}, "
-                f"eps={sparse_check['eps']}"
-            )
-        else:
-            log(
-                "[CHECK] Sparse integrity FAIL: "
-                f"violations_outside_mask={sparse_check['total_violations_outside_mask']}, "
-                f"missing_params={sparse_check['missing_param_count']}, "
-                f"eps={sparse_check['eps']}"
-            )
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "sparsity/check_passed": int(sparse_check.get("passed", False)),
-                    "sparsity/violations_outside_mask": sparse_check.get(
-                        "total_violations_outside_mask", 0
-                    ),
-                    "sparsity/global_sparsity_eps": sparse_check.get(
-                        "global_sparsity_eps", None
-                    ),
-                    "sparsity/eps": sparse_check.get("eps", args.sparse_check_eps),
-                    "train/global_step": global_step,
-                },
-                step=global_step,
-            )
-        if not sparse_check.get("passed", False) and args.fail_on_sparse_violation:
+        if sparse_mode:
+            if sparse_check is None:
+                raise RuntimeError("Internal error: sparse_check should not be None in sparse mode.")
+            if sparse_check.get("passed", False):
+                log(
+                    "[CHECK] Sparse integrity PASS: "
+                    f"violations_outside_mask={sparse_check['total_violations_outside_mask']}, "
+                    f"checked_params={sparse_check['checked_param_count']}, "
+                    f"eps={sparse_check['eps']}"
+                )
+            else:
+                log(
+                    "[CHECK] Sparse integrity FAIL: "
+                    f"violations_outside_mask={sparse_check['total_violations_outside_mask']}, "
+                    f"missing_params={sparse_check['missing_param_count']}, "
+                    f"eps={sparse_check['eps']}"
+                )
             if wandb_run is not None:
-                wandb_run.finish()
-                wandb_run = None
-            raise RuntimeError(
-                "Sparse integrity check failed. "
-                "Set --sparse_check_eps to a larger value or investigate mask enforcement."
-            )
+                wandb_run.log(
+                    {
+                        "sparsity/check_passed": int(sparse_check.get("passed", False)),
+                        "sparsity/violations_outside_mask": sparse_check.get(
+                            "total_violations_outside_mask", 0
+                        ),
+                        "sparsity/global_sparsity_eps": sparse_check.get(
+                            "global_sparsity_eps", None
+                        ),
+                        "sparsity/eps": sparse_check.get("eps", args.sparse_check_eps),
+                        "train/global_step": global_step,
+                    },
+                    step=global_step,
+                )
+            if not sparse_check.get("passed", False) and args.fail_on_sparse_violation:
+                if wandb_run is not None:
+                    wandb_run.finish()
+                    wandb_run = None
+                raise RuntimeError(
+                    "Sparse integrity check failed. "
+                    "Set --sparse_check_eps to a larger value or investigate mask enforcement."
+                )
+        else:
+            log("[CHECK] Sparse integrity check skipped in full finetune mode.")
 
         with open(
             os.path.join(args.output_dir, "distill_stats.json"),
@@ -812,6 +970,7 @@ def main() -> None:
                 {
                     "teacher_model": args.teacher_model,
                     "student_model": args.student_model,
+                    "finetune_mode": "full" if args.full_finetune else "sparse_mask",
                     "backend": (
                         "deepspeed"
                         if use_deepspeed
@@ -832,10 +991,14 @@ def main() -> None:
                         if epoch_eval_history
                         else init_eval_ppl
                     ),
-                    "global_sparsity_masked_params": 1.0
-                    - (total_nonzero / max(1, total)),
-                    "trainable_sparse_weight_count": masked_weight_count(trainable_masks),
+                    "global_sparsity_masked_params": (
+                        1.0 - (total_nonzero / max(1, total)) if sparse_mode else None
+                    ),
+                    "trainable_sparse_weight_count": (
+                        masked_weight_count(trainable_masks) if sparse_mode else None
+                    ),
                     "sparse_integrity_check": sparse_check,
+                    "optimizer_groups": optim_group_summary,
                     "wandb": {
                         "enabled": args.use_wandb,
                         "project": args.wandb_project if args.use_wandb else None,
@@ -849,8 +1012,9 @@ def main() -> None:
                 indent=2,
             )
 
-        log(f"[INFO] Distilled sparse model saved to: {args.output_dir}")
-        log(f"[INFO] Mask file saved to: {out_mask}")
+        log(f"[INFO] Distilled model saved to: {args.output_dir}")
+        if out_mask is not None:
+            log(f"[INFO] Mask file saved to: {out_mask}")
         if wandb_run is not None:
             wandb_run.finish()
 
