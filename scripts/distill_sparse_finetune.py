@@ -59,6 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--alpha_kd", type=float, default=0.7)
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="prune_dist_quant")
+    parser.add_argument("--wandb_run_name", type=str, default="prune_dist_quant")
+    parser.add_argument("--wandb_entity", type=str, default="")
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+    )
     parser.add_argument("--sparse_check_eps", type=float, default=0.0)
     parser.add_argument("--fail_on_sparse_violation", action="store_true")
     parser.add_argument("--use_deepspeed", action="store_true")
@@ -311,6 +321,28 @@ def main() -> None:
 
     set_seed(args.seed + rank)
 
+    wandb = None
+    wandb_run = None
+    if args.use_wandb and is_main_process:
+        try:
+            import wandb as _wandb
+        except Exception as exc:
+            raise RuntimeError(
+                "Weights & Biases is not installed. Install it first: pip install wandb"
+            ) from exc
+        wandb = _wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity if args.wandb_entity else None,
+            mode=args.wandb_mode,
+            config={
+                **vars(args),
+                "rank": rank,
+                "world_size": world_size,
+            },
+        )
+
     log(f"[INFO] rank={rank} local_rank={local_rank} world_size={world_size}")
     log(f"[INFO] Loading tokenizer from: {args.student_model}")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -496,6 +528,16 @@ def main() -> None:
         distributed=args.use_fsdp,
     )
     log(f"[PPL] finetune_start eval_loss={init_eval_loss:.4f} eval_ppl={init_eval_ppl:.4f}")
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "eval/loss": init_eval_loss,
+                "eval/ppl": init_eval_ppl,
+                "train/global_step": global_step,
+                "train/epoch": 0,
+            },
+            step=global_step,
+        )
 
     for epoch in range(args.epochs):
         if train_sampler is not None:
@@ -587,6 +629,19 @@ def main() -> None:
                             "lr": f"{current_lr:.2e}",
                         }
                     )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "train/loss": avg_loss,
+                                "train/ce_loss": avg_ce,
+                                "train/kd_loss": avg_kd,
+                                "train/ppl": avg_train_ppl,
+                                "train/lr": current_lr,
+                                "train/global_step": global_step,
+                                "train/epoch": epoch + 1,
+                            },
+                            step=global_step,
+                        )
                     running_loss = 0.0
                     running_ce = 0.0
                     running_kd = 0.0
@@ -609,6 +664,16 @@ def main() -> None:
             }
         )
         log(f"[PPL] epoch={epoch + 1} eval_loss={eval_loss:.4f} eval_ppl={eval_ppl:.4f}")
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "eval/loss": eval_loss,
+                    "eval/ppl": eval_ppl,
+                    "train/global_step": global_step,
+                    "train/epoch": epoch + 1,
+                },
+                step=global_step,
+            )
 
     with torch.no_grad():
         if not args.use_fsdp:
@@ -714,11 +779,29 @@ def main() -> None:
                 f"missing_params={sparse_check['missing_param_count']}, "
                 f"eps={sparse_check['eps']}"
             )
-            if args.fail_on_sparse_violation:
-                raise RuntimeError(
-                    "Sparse integrity check failed. "
-                    "Set --sparse_check_eps to a larger value or investigate mask enforcement."
-                )
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "sparsity/check_passed": int(sparse_check.get("passed", False)),
+                    "sparsity/violations_outside_mask": sparse_check.get(
+                        "total_violations_outside_mask", 0
+                    ),
+                    "sparsity/global_sparsity_eps": sparse_check.get(
+                        "global_sparsity_eps", None
+                    ),
+                    "sparsity/eps": sparse_check.get("eps", args.sparse_check_eps),
+                    "train/global_step": global_step,
+                },
+                step=global_step,
+            )
+        if not sparse_check.get("passed", False) and args.fail_on_sparse_violation:
+            if wandb_run is not None:
+                wandb_run.finish()
+                wandb_run = None
+            raise RuntimeError(
+                "Sparse integrity check failed. "
+                "Set --sparse_check_eps to a larger value or investigate mask enforcement."
+            )
 
         with open(
             os.path.join(args.output_dir, "distill_stats.json"),
@@ -753,6 +836,12 @@ def main() -> None:
                     - (total_nonzero / max(1, total)),
                     "trainable_sparse_weight_count": masked_weight_count(trainable_masks),
                     "sparse_integrity_check": sparse_check,
+                    "wandb": {
+                        "enabled": args.use_wandb,
+                        "project": args.wandb_project if args.use_wandb else None,
+                        "run_name": args.wandb_run_name if args.use_wandb else None,
+                        "mode": args.wandb_mode if args.use_wandb else None,
+                    },
                     "param_stats": final_stats,
                 },
                 f,
@@ -762,6 +851,8 @@ def main() -> None:
 
         log(f"[INFO] Distilled sparse model saved to: {args.output_dir}")
         log(f"[INFO] Mask file saved to: {out_mask}")
+        if wandb_run is not None:
+            wandb_run.finish()
 
     if args.use_fsdp and dist.is_initialized() and fsdp_dist_initialized_here:
         dist.destroy_process_group()

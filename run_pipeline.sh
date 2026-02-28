@@ -23,6 +23,11 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-}"
 SPARSE_CHECK_EPS="${SPARSE_CHECK_EPS:-0.0}"
 FAIL_ON_SPARSE_VIOLATION="${FAIL_ON_SPARSE_VIOLATION:-1}"  # 1|0
+USE_WANDB="${USE_WANDB:-1}"  # 1|0
+WANDB_PROJECT="${WANDB_PROJECT:-prune_dist_quant}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-prune_dist_quant}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_MODE="${WANDB_MODE:-online}"  # online|offline|disabled
 
 PRUNE_DIR="${WORK_DIR}/pruned"
 DISTILL_DIR="${WORK_DIR}/distilled"
@@ -56,6 +61,13 @@ DISTILL_CMD=(
 
 if [[ "${FAIL_ON_SPARSE_VIOLATION}" == "1" ]]; then
   DISTILL_CMD+=(--fail_on_sparse_violation)
+fi
+
+if [[ "${USE_WANDB}" == "1" ]]; then
+  DISTILL_CMD+=(--use_wandb --wandb_project "${WANDB_PROJECT}" --wandb_run_name "${WANDB_RUN_NAME}" --wandb_mode "${WANDB_MODE}")
+  if [[ -n "${WANDB_ENTITY}" ]]; then
+    DISTILL_CMD+=(--wandb_entity "${WANDB_ENTITY}")
+  fi
 fi
 
 if [[ "${DISTILL_BACKEND}" == "deepspeed" ]]; then

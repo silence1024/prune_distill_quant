@@ -5,6 +5,7 @@ accelerate>=0.33
 tqdm>=4.66
 sentencepiece>=0.2
 protobuf>=5.27
+wandb>=0.17
 # Optional for better INT8/FP8 support:
 # optimum-quanto>=0.2
 # Optional for distillation acceleration / memory optimization:

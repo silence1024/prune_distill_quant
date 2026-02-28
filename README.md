@@ -18,6 +18,7 @@ This repository now contains a runnable reference pipeline for:
   - Only parameters covered by mask are trainable.
   - Gradient and weight updates are masked so zero weights stay zero.
   - Final sparse integrity check: verifies pruned region (mask=0) stays zero after finetune.
+  - Optional Weights & Biases logging (train/eval PPL curves).
   - Optional DeepSpeed backend.
   - Optional FSDP backend (for torchrun / accelerate multi-process launch).
   - Prints `[PPL] finetune_start` and `[PPL] epoch=... eval_ppl=...`.
@@ -36,6 +37,8 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
+# If first time using wandb:
+# wandb login
 # Optional for FP8 and better INT8 path:
 # python -m pip install optimum-quanto
 # Optional for DeepSpeed distillation:
@@ -63,6 +66,8 @@ LR=2e-5 \
 DTYPE=float16 \
 SPARSE_CHECK_EPS=0.0 \
 FAIL_ON_SPARSE_VIOLATION=1 \
+USE_WANDB=1 \
+WANDB_RUN_NAME=prune_dist_quant \
 bash run_pipeline.sh
 ```
 
@@ -119,6 +124,9 @@ python scripts/distill_sparse_finetune.py \
   --epochs 1 \
   --batch_size 1 \
   --grad_accum_steps 8 \
+  --use_wandb \
+  --wandb_project prune_dist_quant \
+  --wandb_run_name prune_dist_quant \
   --fail_on_sparse_violation \
   --use_deepspeed \
   --deepspeed_config configs/deepspeed_zero2.json
@@ -182,3 +190,4 @@ python scripts/quantize_model.py \
 - DeepSpeed path currently supports ZeRO stage `<=2` for sparse mask compatibility.
 - FSDP path requires multi-process launch (`torchrun` or `accelerate launch`) and CUDA.
 - Finetune ends with a sparse integrity check, saved as `sparse_integrity_check` in `distill_stats.json`.
+- `run_pipeline.sh` enables wandb by default (`USE_WANDB=1`) and default `WANDB_RUN_NAME=prune_dist_quant`.
