@@ -478,6 +478,20 @@ def build_lm_packed_iterable_dataset_from_hf_dataset(
     )
 
 
+def _extract_input_ids_from_batch(batch: Any) -> torch.Tensor:
+    if isinstance(batch, torch.Tensor):
+        return batch
+    if isinstance(batch, (tuple, list)) and len(batch) > 0:
+        first = batch[0]
+        if isinstance(first, torch.Tensor):
+            return first
+    if isinstance(batch, dict) and "input_ids" in batch:
+        x = batch["input_ids"]
+        if isinstance(x, torch.Tensor):
+            return x
+    raise TypeError(f"Unsupported batch type for input_ids extraction: {type(batch)}")
+
+
 @torch.no_grad()
 def evaluate_causal_lm_loss_and_ppl_from_dataloader(
     model: torch.nn.Module,
@@ -493,7 +507,8 @@ def evaluate_causal_lm_loss_and_ppl_from_dataloader(
     total_nll = 0.0
     total_tokens = 0
     iterator = tqdm(dataloader, desc=desc) if show_progress else dataloader
-    for (input_ids,) in iterator:
+    for batch in iterator:
+        input_ids = _extract_input_ids_from_batch(batch)
         input_ids = input_ids.to(device)
         outputs = model(input_ids=input_ids, labels=input_ids)
         loss = float(outputs.loss.item())

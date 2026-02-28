@@ -442,6 +442,20 @@ def fsdp_sharding_strategy_from_str(name: str) -> ShardingStrategy:
     return mapping[name]
 
 
+def extract_input_ids_from_batch(batch: Any) -> torch.Tensor:
+    if isinstance(batch, torch.Tensor):
+        return batch
+    if isinstance(batch, (tuple, list)) and len(batch) > 0:
+        first = batch[0]
+        if isinstance(first, torch.Tensor):
+            return first
+    if isinstance(batch, dict) and "input_ids" in batch:
+        input_ids = batch["input_ids"]
+        if isinstance(input_ids, torch.Tensor):
+            return input_ids
+    raise TypeError(f"Unsupported batch type for input_ids extraction: {type(batch)}")
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -963,7 +977,8 @@ def main() -> None:
             disable=not is_main_process,
         )
 
-        for step, (input_ids,) in enumerate(pbar, start=1):
+        for step, batch in enumerate(pbar, start=1):
+            input_ids = extract_input_ids_from_batch(batch)
             input_ids = input_ids.to(device)
             epoch_forward_steps += 1
 
