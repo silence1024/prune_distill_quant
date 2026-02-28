@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import math
 import re
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.distributed as dist
@@ -93,29 +93,20 @@ def _load_dataset_split(
     return ds
 
 
-def build_lm_tensor_dataset(
+def _build_tensor_dataset_from_loaded_dataset(
+    ds: Any,
     tokenizer: AutoTokenizer,
-    dataset_name: str,
-    subset: str | None,
-    split: str,
     seq_len: int,
     max_samples: int,
     show_progress: bool = True,
     tokenize_batch_size: int = 512,
     streaming: bool = False,
+    progress_desc: str = "Tokenizing",
 ) -> TensorDataset:
-    subset_norm = _normalize_subset(subset)
-    ds = _load_dataset_split(
-        dataset_name=dataset_name,
-        subset_norm=subset_norm,
-        split=split,
-        streaming=streaming,
-    )
-
     column_names = getattr(ds, "column_names", None) or []
     if "text" not in column_names:
         raise ValueError(
-            f"Dataset `{dataset_name}` split `{split}` has no `text` column. "
+            "Dataset has no `text` column. "
             f"Available columns: {list(column_names)}"
         )
 
@@ -130,7 +121,7 @@ def build_lm_tensor_dataset(
         processed_chunks = 0
         pbar = tqdm(
             total=max_samples if max_samples > 0 else None,
-            desc=f"Tokenizing(stream) {dataset_name}:{split}",
+            desc=progress_desc,
             disable=not show_progress,
         )
         text_batch: list[str] = []
@@ -181,7 +172,7 @@ def build_lm_tensor_dataset(
         row_iter = range(0, total_rows, tokenize_batch_size)
         pbar = tqdm(
             row_iter,
-            desc=f"Tokenizing {dataset_name}:{split}",
+            desc=progress_desc,
             disable=not show_progress,
         )
         for start in pbar:
@@ -220,6 +211,62 @@ def build_lm_tensor_dataset(
         num_chunks, seq_len
     )
     return TensorDataset(ids)
+
+
+def build_lm_tensor_dataset(
+    tokenizer: AutoTokenizer,
+    dataset_name: str,
+    subset: str | None,
+    split: str,
+    seq_len: int,
+    max_samples: int,
+    show_progress: bool = True,
+    tokenize_batch_size: int = 512,
+    streaming: bool = False,
+) -> TensorDataset:
+    subset_norm = _normalize_subset(subset)
+    ds = _load_dataset_split(
+        dataset_name=dataset_name,
+        subset_norm=subset_norm,
+        split=split,
+        streaming=streaming,
+    )
+    return _build_tensor_dataset_from_loaded_dataset(
+        ds=ds,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        max_samples=max_samples,
+        show_progress=show_progress,
+        tokenize_batch_size=tokenize_batch_size,
+        streaming=streaming,
+        progress_desc=(
+            f"Tokenizing(stream) {dataset_name}:{split}"
+            if streaming
+            else f"Tokenizing {dataset_name}:{split}"
+        ),
+    )
+
+
+def build_lm_tensor_dataset_from_hf_dataset(
+    tokenizer: AutoTokenizer,
+    ds: Any,
+    seq_len: int,
+    max_samples: int,
+    show_progress: bool = True,
+    tokenize_batch_size: int = 512,
+    streaming: bool = False,
+    progress_desc: str = "Tokenizing",
+) -> TensorDataset:
+    return _build_tensor_dataset_from_loaded_dataset(
+        ds=ds,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        max_samples=max_samples,
+        show_progress=show_progress,
+        tokenize_batch_size=tokenize_batch_size,
+        streaming=streaming,
+        progress_desc=progress_desc,
+    )
 
 
 @torch.no_grad()

@@ -8,8 +8,9 @@ import random
 from contextlib import nullcontext
 from datetime import timedelta
 from functools import partial
-from typing import Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
+import datasets
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -29,6 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedul
 
 from ppl_utils import (
     build_lm_tensor_dataset,
+    build_lm_tensor_dataset_from_hf_dataset,
     evaluate_causal_lm_loss_and_ppl_from_dataloader,
     loss_to_ppl,
 )
@@ -43,9 +45,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask_file", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="openwebtext")
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="",
+        help="HF dataset path used for loading; defaults to --dataset when empty.",
+    )
     parser.add_argument("--dataset_subset", type=str, default="none")
     parser.add_argument("--train_split", type=str, default="train[:99%]")
     parser.add_argument("--eval_split", type=str, default="train[99%:]")
+    parser.add_argument(
+        "--openwebtext_eval_ratio",
+        type=float,
+        default=0.05,
+        help="Eval split ratio when loading openwebtext via train_test_split.",
+    )
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--tokenize_batch_size", type=int, default=512)
     parser.add_argument(
@@ -157,6 +171,43 @@ def load_deepspeed_config(path: str) -> Dict:
             "accumulation via --grad_accum_steps."
         )
     return cfg
+
+
+def _load_dataset_ddp_safe(
+    desc: str,
+    loader: Callable[[bool], Any],
+) -> Any:
+    try:
+        return loader(local_files_only=False)
+    except Exception:
+        # Fallback: try local cache only, useful when remote/network is unstable.
+        try:
+            return loader(local_files_only=True)
+        except Exception as second_exc:
+            raise RuntimeError(
+                f"Failed to load dataset for `{desc}` in both remote and local-only modes."
+            ) from second_exc
+
+
+def load_train_data(args: argparse.Namespace) -> Tuple[Any, Any]:
+    if args.dataset != "openwebtext":
+        raise ValueError("load_train_data currently supports dataset=openwebtext only.")
+    if args.openwebtext_eval_ratio <= 0.0 or args.openwebtext_eval_ratio >= 1.0:
+        raise ValueError("--openwebtext_eval_ratio must be in (0, 1).")
+
+    dataset_path = args.dataset_path if args.dataset_path else args.dataset
+
+    def _loader(local_files_only: bool) -> Any:
+        kwargs: Dict[str, Any] = {"split": "train", "trust_remote_code": True}
+        if local_files_only:
+            kwargs["download_config"] = datasets.DownloadConfig(local_files_only=True)
+        if str(args.dataset_subset).strip().lower() in {"", "none", "null"}:
+            return datasets.load_dataset(dataset_path, **kwargs)
+        return datasets.load_dataset(dataset_path, args.dataset_subset, **kwargs)
+
+    ds = _load_dataset_ddp_safe(desc=f"{dataset_path}:train", loader=_loader)
+    ds = ds.train_test_split(test_size=args.openwebtext_eval_ratio, seed=args.seed)
+    return ds, ds["train"]
 
 
 def get_dist_info() -> Tuple[int, int, int]:
@@ -387,6 +438,8 @@ def main() -> None:
         raise ValueError("--embed_head_lr_ratio must be > 0.")
     if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
         raise ValueError("--warmup_ratio must be in [0, 1).")
+    if args.openwebtext_eval_ratio <= 0.0 or args.openwebtext_eval_ratio >= 1.0:
+        raise ValueError("--openwebtext_eval_ratio must be in (0, 1).")
 
     if args.use_deepspeed and args.use_fsdp:
         raise ValueError("Choose only one backend: --use_deepspeed or --use_fsdp.")
@@ -548,6 +601,44 @@ def main() -> None:
         log(f"[INFO] {tag} tensor dataset size (chunks): {len(ds)}")
         return ds
 
+    def build_openwebtext_train_eval() -> Tuple[TensorDataset, TensorDataset]:
+        if args.dataset_streaming:
+            log(
+                "[WARN] --dataset_streaming is ignored when dataset=openwebtext "
+                "with train_test_split loading."
+            )
+        ds_dict, _ = load_train_data(args)
+        train_hf = ds_dict["train"]
+        eval_hf = ds_dict["test"]
+        log(
+            "[INFO] OpenWebText loaded with train_test_split: "
+            f"train_rows={len(train_hf)}, eval_rows={len(eval_hf)}, "
+            f"eval_ratio={args.openwebtext_eval_ratio}"
+        )
+        train_ds = build_lm_tensor_dataset_from_hf_dataset(
+            tokenizer=tokenizer,
+            ds=train_hf,
+            seq_len=args.seq_len,
+            max_samples=args.max_train_samples,
+            show_progress=is_main_process,
+            tokenize_batch_size=args.tokenize_batch_size,
+            streaming=False,
+            progress_desc="Tokenizing openwebtext:train",
+        )
+        eval_ds = build_lm_tensor_dataset_from_hf_dataset(
+            tokenizer=tokenizer,
+            ds=eval_hf,
+            seq_len=args.seq_len,
+            max_samples=args.max_eval_samples,
+            show_progress=is_main_process,
+            tokenize_batch_size=args.tokenize_batch_size,
+            streaming=False,
+            progress_desc="Tokenizing openwebtext:eval",
+        )
+        log(f"[INFO] Train tensor dataset size (chunks): {len(train_ds)}")
+        log(f"[INFO] Eval tensor dataset size (chunks): {len(eval_ds)}")
+        return train_ds, eval_ds
+
     def load_cached_input_ids(path: str) -> torch.Tensor:
         obj = torch.load(path, map_location="cpu")
         if isinstance(obj, dict) and "input_ids" in obj:
@@ -592,21 +683,33 @@ def main() -> None:
         train_ds: TensorDataset
         eval_ds: TensorDataset
         if is_main_process:
-            if os.path.exists(train_cache_path):
+            if os.path.exists(train_cache_path) and os.path.exists(eval_cache_path):
                 log(f"[INFO] Loading cached train tokenized tensor: {train_cache_path}")
-                train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
-            else:
-                train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
-                torch.save(train_ds.tensors[0], train_cache_path)
-                log(f"[INFO] Saved train tokenized cache: {train_cache_path}")
-
-            if os.path.exists(eval_cache_path):
                 log(f"[INFO] Loading cached eval tokenized tensor: {eval_cache_path}")
+                train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
                 eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
             else:
-                eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
-                torch.save(eval_ds.tensors[0], eval_cache_path)
-                log(f"[INFO] Saved eval tokenized cache: {eval_cache_path}")
+                if args.dataset == "openwebtext":
+                    train_ds, eval_ds = build_openwebtext_train_eval()
+                    torch.save(train_ds.tensors[0], train_cache_path)
+                    torch.save(eval_ds.tensors[0], eval_cache_path)
+                    log(f"[INFO] Saved train tokenized cache: {train_cache_path}")
+                    log(f"[INFO] Saved eval tokenized cache: {eval_cache_path}")
+                else:
+                    if os.path.exists(train_cache_path):
+                        log(f"[INFO] Loading cached train tokenized tensor: {train_cache_path}")
+                        train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
+                    else:
+                        train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
+                        torch.save(train_ds.tensors[0], train_cache_path)
+                        log(f"[INFO] Saved train tokenized cache: {train_cache_path}")
+                    if os.path.exists(eval_cache_path):
+                        log(f"[INFO] Loading cached eval tokenized tensor: {eval_cache_path}")
+                        eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
+                    else:
+                        eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
+                        torch.save(eval_ds.tensors[0], eval_cache_path)
+                        log(f"[INFO] Saved eval tokenized cache: {eval_cache_path}")
 
         if dist.is_initialized():
             dist.barrier()
@@ -615,8 +718,11 @@ def main() -> None:
             train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
             eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
     else:
-        train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
-        eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
+        if args.dataset == "openwebtext":
+            train_ds, eval_ds = build_openwebtext_train_eval()
+        else:
+            train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
+            eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
 
     train_sampler = None
     eval_sampler = None
