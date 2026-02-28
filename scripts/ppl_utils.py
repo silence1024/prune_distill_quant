@@ -3,6 +3,7 @@ import math
 from typing import Tuple
 
 import torch
+import torch.distributed as dist
 from datasets import load_dataset
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
@@ -36,15 +37,14 @@ def build_lm_tensor_dataset(
 
 
 @torch.no_grad()
-def evaluate_causal_lm_loss_and_ppl(
+def evaluate_causal_lm_loss_and_ppl_from_dataloader(
     model: torch.nn.Module,
-    dataset: TensorDataset,
+    dataloader: DataLoader,
     device: torch.device,
-    batch_size: int = 1,
     desc: str = "PPL Eval",
     show_progress: bool = True,
+    distributed: bool = False,
 ) -> Tuple[float, float]:
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
     was_training = model.training
     model.eval()
 
@@ -59,9 +59,37 @@ def evaluate_causal_lm_loss_and_ppl(
         total_nll += loss * num_target_tokens
         total_tokens += num_target_tokens
 
+    if distributed and dist.is_available() and dist.is_initialized():
+        total_nll_tensor = torch.tensor(total_nll, device=device, dtype=torch.float64)
+        total_tokens_tensor = torch.tensor(total_tokens, device=device, dtype=torch.float64)
+        dist.all_reduce(total_nll_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens_tensor, op=dist.ReduceOp.SUM)
+        total_nll = float(total_nll_tensor.item())
+        total_tokens = int(total_tokens_tensor.item())
+
     avg_loss = total_nll / max(1, total_tokens)
     ppl = loss_to_ppl(avg_loss)
 
     if was_training:
         model.train()
     return avg_loss, ppl
+
+
+@torch.no_grad()
+def evaluate_causal_lm_loss_and_ppl(
+    model: torch.nn.Module,
+    dataset: TensorDataset,
+    device: torch.device,
+    batch_size: int = 1,
+    desc: str = "PPL Eval",
+    show_progress: bool = True,
+) -> Tuple[float, float]:
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+    return evaluate_causal_lm_loss_and_ppl_from_dataloader(
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        desc=desc,
+        show_progress=show_progress,
+        distributed=False,
+    )

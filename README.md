@@ -17,6 +17,9 @@ This repository now contains a runnable reference pipeline for:
   - Teacher-student distillation on WikiText-2.
   - Only parameters covered by mask are trainable.
   - Gradient and weight updates are masked so zero weights stay zero.
+  - Final sparse integrity check: verifies pruned region (mask=0) stays zero after finetune.
+  - Optional DeepSpeed backend.
+  - Optional FSDP backend (for torchrun / accelerate multi-process launch).
   - Prints `[PPL] finetune_start` and `[PPL] epoch=... eval_ppl=...`.
 - `scripts/quantize_model.py`
   - Quantizes the distilled model to INT8 or FP8.
@@ -35,6 +38,9 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 # Optional for FP8 and better INT8 path:
 # python -m pip install optimum-quanto
+# Optional for DeepSpeed distillation:
+# python -m pip install deepspeed
+# accelerate already included in requirements and can be used as launcher.
 ```
 
 ## Quick Start
@@ -55,6 +61,36 @@ BATCH_SIZE=1 \
 GRAD_ACCUM=8 \
 LR=2e-5 \
 DTYPE=float16 \
+SPARSE_CHECK_EPS=0.0 \
+FAIL_ON_SPARSE_VIOLATION=1 \
+bash run_pipeline.sh
+```
+
+Enable DeepSpeed during distillation:
+
+```bash
+DISTILL_BACKEND=deepspeed \
+DISTILL_LAUNCHER=python \
+DEEPSPEED_CONFIG=configs/deepspeed_zero2.json \
+bash run_pipeline.sh
+```
+
+Enable FSDP (torchrun):
+
+```bash
+DISTILL_BACKEND=fsdp \
+DISTILL_LAUNCHER=torchrun \
+NPROC_PER_NODE=4 \
+MASTER_PORT=29501 \
+bash run_pipeline.sh
+```
+
+Enable FSDP (accelerate launcher):
+
+```bash
+DISTILL_BACKEND=fsdp \
+DISTILL_LAUNCHER=accelerate \
+NPROC_PER_NODE=4 \
 bash run_pipeline.sh
 ```
 
@@ -82,7 +118,40 @@ python scripts/distill_sparse_finetune.py \
   --seq_len 512 \
   --epochs 1 \
   --batch_size 1 \
-  --grad_accum_steps 8
+  --grad_accum_steps 8 \
+  --fail_on_sparse_violation \
+  --use_deepspeed \
+  --deepspeed_config configs/deepspeed_zero2.json
+```
+
+Distillation with FSDP via torchrun:
+
+```bash
+torchrun --nproc_per_node 4 --master_port 29501 scripts/distill_sparse_finetune.py \
+  --teacher_model Qwen/Qwen3-0.6B \
+  --student_model outputs/pruned \
+  --mask_file outputs/pruned/sparsity_mask.pt \
+  --output_dir outputs/distilled_fsdp \
+  --seq_len 512 \
+  --epochs 1 \
+  --batch_size 1 \
+  --grad_accum_steps 8 \
+  --use_fsdp
+```
+
+Distillation with FSDP via accelerate launch:
+
+```bash
+accelerate launch --num_processes 4 scripts/distill_sparse_finetune.py \
+  --teacher_model Qwen/Qwen3-0.6B \
+  --student_model outputs/pruned \
+  --mask_file outputs/pruned/sparsity_mask.pt \
+  --output_dir outputs/distilled_fsdp \
+  --seq_len 512 \
+  --epochs 1 \
+  --batch_size 1 \
+  --grad_accum_steps 8 \
+  --use_fsdp
 ```
 
 INT8 quantization:
@@ -110,3 +179,6 @@ python scripts/quantize_model.py \
 - Zeroed sparse weights are re-masked after each optimizer step to enforce exact sparsity.
 - FP8 requires a backend that supports FP8 weight quantization (`optimum-quanto` in this implementation).
 - PPL evaluation defaults to WikiText-2 `test` split and can be disabled with `--skip_ppl_eval`.
+- DeepSpeed path currently supports ZeRO stage `<=2` for sparse mask compatibility.
+- FSDP path requires multi-process launch (`torchrun` or `accelerate launch`) and CUDA.
+- Finetune ends with a sparse integrity check, saved as `sparse_integrity_check` in `distill_stats.json`.

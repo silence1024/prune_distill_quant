@@ -15,6 +15,14 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 LR="${LR:-2e-5}"
 DTYPE="${DTYPE:-float16}"
+DISTILL_BACKEND="${DISTILL_BACKEND:-none}"  # none|deepspeed|fsdp
+DISTILL_LAUNCHER="${DISTILL_LAUNCHER:-python}"  # python|torchrun|accelerate
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-configs/deepspeed_zero2.json}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+MASTER_PORT="${MASTER_PORT:-29501}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-}"
+SPARSE_CHECK_EPS="${SPARSE_CHECK_EPS:-0.0}"
+FAIL_ON_SPARSE_VIOLATION="${FAIL_ON_SPARSE_VIOLATION:-1}"  # 1|0
 
 PRUNE_DIR="${WORK_DIR}/pruned"
 DISTILL_DIR="${WORK_DIR}/distilled"
@@ -31,17 +39,58 @@ python scripts/prune_sparsegpt.py \
   --nsamples "${CALIB_SAMPLES}" \
   --dtype "${DTYPE}"
 
-python scripts/distill_sparse_finetune.py \
-  --teacher_model "${MODEL_ID}" \
-  --student_model "${PRUNE_DIR}" \
-  --mask_file "${PRUNE_DIR}/sparsity_mask.pt" \
-  --output_dir "${DISTILL_DIR}" \
-  --seq_len "${SEQ_LEN}" \
-  --epochs "${EPOCHS}" \
-  --batch_size "${BATCH_SIZE}" \
-  --grad_accum_steps "${GRAD_ACCUM}" \
-  --lr "${LR}" \
+DISTILL_CMD=(
+  scripts/distill_sparse_finetune.py
+  --teacher_model "${MODEL_ID}"
+  --student_model "${PRUNE_DIR}"
+  --mask_file "${PRUNE_DIR}/sparsity_mask.pt"
+  --output_dir "${DISTILL_DIR}"
+  --seq_len "${SEQ_LEN}"
+  --epochs "${EPOCHS}"
+  --batch_size "${BATCH_SIZE}"
+  --grad_accum_steps "${GRAD_ACCUM}"
+  --lr "${LR}"
   --dtype "${DTYPE}"
+  --sparse_check_eps "${SPARSE_CHECK_EPS}"
+)
+
+if [[ "${FAIL_ON_SPARSE_VIOLATION}" == "1" ]]; then
+  DISTILL_CMD+=(--fail_on_sparse_violation)
+fi
+
+if [[ "${DISTILL_BACKEND}" == "deepspeed" ]]; then
+  DISTILL_CMD+=(--use_deepspeed --deepspeed_config "${DEEPSPEED_CONFIG}")
+elif [[ "${DISTILL_BACKEND}" == "fsdp" ]]; then
+  DISTILL_CMD+=(--use_fsdp)
+elif [[ "${DISTILL_BACKEND}" != "none" ]]; then
+  echo "[ERROR] DISTILL_BACKEND must be one of: none|deepspeed|fsdp" >&2
+  exit 1
+fi
+
+if [[ "${DISTILL_BACKEND}" == "fsdp" && "${DISTILL_LAUNCHER}" == "python" ]]; then
+  echo "[ERROR] FSDP needs multi-process launch. Set DISTILL_LAUNCHER=torchrun or accelerate." >&2
+  exit 1
+fi
+
+if [[ "${DISTILL_LAUNCHER}" == "python" ]]; then
+  python "${DISTILL_CMD[@]}"
+elif [[ "${DISTILL_LAUNCHER}" == "torchrun" ]]; then
+  torchrun \
+    --nproc_per_node "${NPROC_PER_NODE}" \
+    --master_port "${MASTER_PORT}" \
+    "${DISTILL_CMD[@]}"
+elif [[ "${DISTILL_LAUNCHER}" == "accelerate" ]]; then
+  ACCELERATE_CMD=(accelerate launch)
+  if [[ -n "${ACCELERATE_CONFIG}" ]]; then
+    ACCELERATE_CMD+=(--config_file "${ACCELERATE_CONFIG}")
+  else
+    ACCELERATE_CMD+=(--num_processes "${NPROC_PER_NODE}")
+  fi
+  "${ACCELERATE_CMD[@]}" "${DISTILL_CMD[@]}"
+else
+  echo "[ERROR] DISTILL_LAUNCHER must be one of: python|torchrun|accelerate" >&2
+  exit 1
+fi
 
 python scripts/quantize_model.py \
   --model_dir "${DISTILL_DIR}" \
