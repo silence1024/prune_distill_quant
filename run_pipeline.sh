@@ -19,12 +19,21 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.02}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 DTYPE="${DTYPE:-bfloat16}"
 FULL_FINETUNE="${FULL_FINETUNE:-1}"  # 1|0
+# Prune dataset options
+PRUNE_CALIB_DATASET="${PRUNE_CALIB_DATASET:-openwebtext}"
+PRUNE_CALIB_SUBSET="${PRUNE_CALIB_SUBSET-none}"
+PRUNE_CALIB_SPLIT="${PRUNE_CALIB_SPLIT:-train[:1%]}"
+PRUNE_PPL_DATASET="${PRUNE_PPL_DATASET:-openwebtext}"
+PRUNE_PPL_SUBSET="${PRUNE_PPL_SUBSET-none}"
+PRUNE_PPL_SPLIT="${PRUNE_PPL_SPLIT:-train[99%:]}"
+PRUNE_PPL_MAX_SAMPLES="${PRUNE_PPL_MAX_SAMPLES:-256}"
+PRUNE_SKIP_PPL_EVAL="${PRUNE_SKIP_PPL_EVAL:-0}"  # 1|0
 # Distill dataset options
-DISTILL_DATASET="${DISTILL_DATASET:-wikitext}"
-DISTILL_DATASET_SUBSET="${DISTILL_DATASET_SUBSET:-wikitext-2-raw-v1}"
+DISTILL_DATASET="${DISTILL_DATASET:-openwebtext}"
+DISTILL_DATASET_SUBSET="${DISTILL_DATASET_SUBSET-none}"
 DISTILL_TRAIN_SPLIT="${DISTILL_TRAIN_SPLIT:-train[:99%]}"
 DISTILL_EVAL_SPLIT="${DISTILL_EVAL_SPLIT:-train[99%:]}"
-DISTILL_MAX_TRAIN_SAMPLES="${DISTILL_MAX_TRAIN_SAMPLES:-4000}"
+DISTILL_MAX_TRAIN_SAMPLES="${DISTILL_MAX_TRAIN_SAMPLES:--1}"
 DISTILL_MAX_EVAL_SAMPLES="${DISTILL_MAX_EVAL_SAMPLES:-400}"
 DISTILL_TOKENIZE_BATCH_SIZE="${DISTILL_TOKENIZE_BATCH_SIZE:-512}"
 DISTILL_BACKEND="${DISTILL_BACKEND:-none}"  # none|deepspeed|fsdp
@@ -48,13 +57,26 @@ FP8_DIR="${WORK_DIR}/quant_fp8"
 
 mkdir -p "${WORK_DIR}"
 
-python scripts/prune_sparsegpt.py \
-  --model_id "${MODEL_ID}" \
-  --output_dir "${PRUNE_DIR}" \
-  --sparsity "${SPARSITY}" \
-  --seq_len "${SEQ_LEN}" \
-  --nsamples "${CALIB_SAMPLES}" \
+PRUNE_CMD=(
+  scripts/prune_sparsegpt.py
+  --model_id "${MODEL_ID}"
+  --output_dir "${PRUNE_DIR}"
+  --sparsity "${SPARSITY}"
+  --calib_dataset "${PRUNE_CALIB_DATASET}"
+  --calib_subset "${PRUNE_CALIB_SUBSET}"
+  --calib_split "${PRUNE_CALIB_SPLIT}"
+  --ppl_dataset "${PRUNE_PPL_DATASET}"
+  --ppl_subset "${PRUNE_PPL_SUBSET}"
+  --ppl_split "${PRUNE_PPL_SPLIT}"
+  --ppl_max_samples "${PRUNE_PPL_MAX_SAMPLES}"
+  --seq_len "${SEQ_LEN}"
+  --nsamples "${CALIB_SAMPLES}"
   --dtype "${DTYPE}"
+)
+if [[ "${PRUNE_SKIP_PPL_EVAL}" == "1" ]]; then
+  PRUNE_CMD+=(--skip_ppl_eval)
+fi
+python "${PRUNE_CMD[@]}"
 
 DISTILL_CMD=(
   scripts/distill_sparse_finetune.py

@@ -41,13 +41,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student_model", type=str, required=True)
     parser.add_argument("--mask_file", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="wikitext")
-    parser.add_argument("--dataset_subset", type=str, default="wikitext-2-raw-v1")
-    parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--eval_split", type=str, default="validation")
+    parser.add_argument("--dataset", type=str, default="openwebtext")
+    parser.add_argument("--dataset_subset", type=str, default="none")
+    parser.add_argument("--train_split", type=str, default="train[:99%]")
+    parser.add_argument("--eval_split", type=str, default="train[99%:]")
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--tokenize_batch_size", type=int, default=512)
-    parser.add_argument("--max_train_samples", type=int, default=4000)
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=-1,
+        help="Max number of train chunks. <=0 means use all available chunks.",
+    )
     parser.add_argument("--max_eval_samples", type=int, default=400)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)

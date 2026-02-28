@@ -21,9 +21,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--sparsity", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--calib_dataset", type=str, default="wikitext")
-    parser.add_argument("--calib_subset", type=str, default="wikitext-2-raw-v1")
-    parser.add_argument("--calib_split", type=str, default="train")
+    parser.add_argument("--calib_dataset", type=str, default="openwebtext")
+    parser.add_argument("--calib_subset", type=str, default="none")
+    parser.add_argument("--calib_split", type=str, default="train[:1%]")
     parser.add_argument("--nsamples", type=int, default=64)
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--max_hessian_rows", type=int, default=4096)
@@ -42,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--include_lm_head", action="store_true")
     parser.add_argument("--skip_ppl_eval", action="store_true")
-    parser.add_argument("--ppl_dataset", type=str, default="wikitext")
-    parser.add_argument("--ppl_subset", type=str, default="wikitext-2-raw-v1")
-    parser.add_argument("--ppl_split", type=str, default="test")
+    parser.add_argument("--ppl_dataset", type=str, default="openwebtext")
+    parser.add_argument("--ppl_subset", type=str, default="none")
+    parser.add_argument("--ppl_split", type=str, default="train[99%:]")
     parser.add_argument("--ppl_seq_len", type=int, default=512)
     parser.add_argument("--ppl_max_samples", type=int, default=256)
     parser.add_argument("--ppl_batch_size", type=int, default=1)
@@ -75,24 +75,64 @@ def adapt_dtype_for_device(dtype: torch.dtype, device: torch.device) -> torch.dt
 def build_calibration_samples(
     tokenizer: AutoTokenizer,
     dataset_name: str,
-    subset: str,
+    subset: str | None,
     split: str,
     nsamples: int,
     seq_len: int,
     seed: int,
 ) -> List[torch.Tensor]:
-    ds = load_dataset(dataset_name, subset, split=split)
-    text = "\n\n".join([t for t in ds["text"] if t and not t.isspace()])
-    tokens = tokenizer(text, return_tensors="pt").input_ids[0]
-    if tokens.numel() <= seq_len + 1:
-        raise ValueError("Calibration corpus is too short for the configured seq_len.")
+    subset_norm = subset
+    if subset_norm is not None and str(subset_norm).strip().lower() in {"", "none", "null"}:
+        subset_norm = None
+    if subset_norm is None:
+        ds = load_dataset(dataset_name, split=split)
+    else:
+        ds = load_dataset(dataset_name, subset_norm, split=split)
+    if "text" not in ds.column_names:
+        raise ValueError(
+            f"Calibration dataset `{dataset_name}` split `{split}` has no `text` column. "
+            f"Available columns: {list(ds.column_names)}"
+        )
 
+    num_rows = len(ds)
+    if num_rows == 0:
+        raise ValueError(f"Calibration dataset `{dataset_name}` split `{split}` is empty.")
+
+    eos_id = tokenizer.eos_token_id
     rng = random.Random(seed)
     samples: List[torch.Tensor] = []
-    for _ in range(nsamples):
-        start = rng.randint(0, tokens.numel() - seq_len - 1)
-        chunk = tokens[start : start + seq_len]
+    max_attempts = max(1000, nsamples * 64)
+    attempts = 0
+
+    while len(samples) < nsamples and attempts < max_attempts:
+        attempts += 1
+        idx = rng.randrange(num_rows)
+        text = ds[int(idx)]["text"]
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        token_ids = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            truncation=False,
+        )["input_ids"]
+        if eos_id is not None:
+            token_ids = token_ids + [eos_id]
+        if len(token_ids) < seq_len + 1:
+            continue
+
+        start = rng.randint(0, len(token_ids) - seq_len - 1)
+        chunk = torch.tensor(token_ids[start : start + seq_len], dtype=torch.long)
         samples.append(chunk.unsqueeze(0))
+
+    if len(samples) < nsamples:
+        raise ValueError(
+            "Unable to build enough calibration samples from the current dataset settings. "
+            f"Requested={nsamples}, collected={len(samples)}. "
+            "Try smaller --seq_len, larger/more diverse --calib_split, or different dataset."
+        )
+
     return samples
 
 
