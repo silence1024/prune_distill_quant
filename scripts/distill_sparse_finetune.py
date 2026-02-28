@@ -24,12 +24,13 @@ from torch.distributed.fsdp import (
     StateDictType,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
+from torch.utils.data import DataLoader, DistributedSampler, IterableDataset, TensorDataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
 from ppl_utils import (
     build_lm_tensor_dataset,
+    build_lm_packed_iterable_dataset_from_hf_dataset,
     build_lm_tensor_dataset_from_hf_dataset,
     evaluate_causal_lm_loss_and_ppl_from_dataloader,
     loss_to_ppl,
@@ -62,6 +63,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--tokenize_batch_size", type=int, default=512)
+    parser.add_argument(
+        "--online_train_packing",
+        action="store_true",
+        help="Use IterableDataset for online tokenization/packing on train split.",
+    )
+    parser.add_argument(
+        "--estimate_sample_size",
+        type=int,
+        default=2048,
+        help="Rows sampled to estimate train steps when online packing uses full dataset.",
+    )
     parser.add_argument(
         "--dataset_streaming",
         action="store_true",
@@ -440,6 +452,8 @@ def main() -> None:
         raise ValueError("--warmup_ratio must be in [0, 1).")
     if args.openwebtext_eval_ratio <= 0.0 or args.openwebtext_eval_ratio >= 1.0:
         raise ValueError("--openwebtext_eval_ratio must be in (0, 1).")
+    if args.estimate_sample_size <= 0:
+        raise ValueError("--estimate_sample_size must be > 0.")
 
     if args.use_deepspeed and args.use_fsdp:
         raise ValueError("Choose only one backend: --use_deepspeed or --use_fsdp.")
@@ -601,7 +615,9 @@ def main() -> None:
         log(f"[INFO] {tag} tensor dataset size (chunks): {len(ds)}")
         return ds
 
-    def build_openwebtext_train_eval() -> Tuple[TensorDataset, TensorDataset]:
+    def build_openwebtext_train_eval(
+        build_eval: bool = True,
+    ) -> Tuple[TensorDataset | IterableDataset, TensorDataset | None]:
         if args.dataset_streaming:
             log(
                 "[WARN] --dataset_streaming is ignored when dataset=openwebtext "
@@ -615,28 +631,59 @@ def main() -> None:
             f"train_rows={len(train_hf)}, eval_rows={len(eval_hf)}, "
             f"eval_ratio={args.openwebtext_eval_ratio}"
         )
-        train_ds = build_lm_tensor_dataset_from_hf_dataset(
-            tokenizer=tokenizer,
-            ds=train_hf,
-            seq_len=args.seq_len,
-            max_samples=args.max_train_samples,
-            show_progress=is_main_process,
-            tokenize_batch_size=args.tokenize_batch_size,
-            streaming=False,
-            progress_desc="Tokenizing openwebtext:train",
-        )
-        eval_ds = build_lm_tensor_dataset_from_hf_dataset(
-            tokenizer=tokenizer,
-            ds=eval_hf,
-            seq_len=args.seq_len,
-            max_samples=args.max_eval_samples,
-            show_progress=is_main_process,
-            tokenize_batch_size=args.tokenize_batch_size,
-            streaming=False,
-            progress_desc="Tokenizing openwebtext:eval",
-        )
-        log(f"[INFO] Train tensor dataset size (chunks): {len(train_ds)}")
-        log(f"[INFO] Eval tensor dataset size (chunks): {len(eval_ds)}")
+        if args.online_train_packing:
+            train_ds = build_lm_packed_iterable_dataset_from_hf_dataset(
+                ds=train_hf,
+                tokenizer=tokenizer,
+                seq_len=args.seq_len,
+                max_samples=args.max_train_samples,
+                tokenize_batch_size=args.tokenize_batch_size,
+                rank=rank,
+                world_size=world_size,
+                seed=args.seed,
+                estimate_sample_size=args.estimate_sample_size,
+                shuffle=True,
+            )
+            try:
+                est_local_chunks = len(train_ds)
+                log(
+                    "[INFO] Online train packing enabled: "
+                    f"estimated_local_chunks={est_local_chunks}"
+                )
+            except Exception:
+                log("[INFO] Online train packing enabled: local chunk count unknown.")
+        else:
+            train_ds = build_lm_tensor_dataset_from_hf_dataset(
+                tokenizer=tokenizer,
+                ds=train_hf,
+                seq_len=args.seq_len,
+                max_samples=args.max_train_samples,
+                show_progress=is_main_process,
+                tokenize_batch_size=args.tokenize_batch_size,
+                streaming=False,
+                progress_desc="Tokenizing openwebtext:train",
+            )
+        eval_ds: TensorDataset | None = None
+        if build_eval:
+            eval_ds = build_lm_tensor_dataset_from_hf_dataset(
+                tokenizer=tokenizer,
+                ds=eval_hf,
+                seq_len=args.seq_len,
+                max_samples=args.max_eval_samples,
+                show_progress=is_main_process,
+                tokenize_batch_size=args.tokenize_batch_size,
+                streaming=False,
+                progress_desc="Tokenizing openwebtext:eval",
+            )
+        if isinstance(train_ds, IterableDataset):
+            try:
+                log(f"[INFO] Train iterable estimated size (chunks): {len(train_ds)}")
+            except Exception:
+                log("[INFO] Train iterable size (chunks): unknown")
+        else:
+            log(f"[INFO] Train tensor dataset size (chunks): {len(train_ds)}")
+        if eval_ds is not None:
+            log(f"[INFO] Eval tensor dataset size (chunks): {len(eval_ds)}")
         return train_ds, eval_ds
 
     def load_cached_input_ids(path: str) -> torch.Tensor:
@@ -680,20 +727,39 @@ def main() -> None:
         if dist.is_initialized():
             dist.barrier()
 
-        train_ds: TensorDataset
+        train_ds: TensorDataset | IterableDataset
         eval_ds: TensorDataset
         if is_main_process:
-            if os.path.exists(train_cache_path) and os.path.exists(eval_cache_path):
+            if args.dataset == "openwebtext" and args.online_train_packing:
+                if os.path.exists(eval_cache_path):
+                    log(f"[INFO] Loading cached eval tokenized tensor: {eval_cache_path}")
+                    train_ds, _ = build_openwebtext_train_eval(build_eval=False)
+                    eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
+                else:
+                    train_ds, eval_tmp = build_openwebtext_train_eval(build_eval=True)
+                    if eval_tmp is None:
+                        raise RuntimeError("Internal error: expected openwebtext eval dataset.")
+                    eval_ds = eval_tmp
+                    torch.save(eval_ds.tensors[0], eval_cache_path)
+                    log(f"[INFO] Saved eval tokenized cache: {eval_cache_path}")
+            elif os.path.exists(train_cache_path) and os.path.exists(eval_cache_path):
                 log(f"[INFO] Loading cached train tokenized tensor: {train_cache_path}")
                 log(f"[INFO] Loading cached eval tokenized tensor: {eval_cache_path}")
                 train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
                 eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
             else:
                 if args.dataset == "openwebtext":
-                    train_ds, eval_ds = build_openwebtext_train_eval()
-                    torch.save(train_ds.tensors[0], train_cache_path)
+                    train_ds, eval_tmp = build_openwebtext_train_eval(build_eval=True)
+                    if eval_tmp is None:
+                        raise RuntimeError("Internal error: expected openwebtext eval dataset.")
+                    eval_ds = eval_tmp
+                    if isinstance(train_ds, TensorDataset):
+                        torch.save(train_ds.tensors[0], train_cache_path)
+                        log(f"[INFO] Saved train tokenized cache: {train_cache_path}")
+                    else:
+                        # IterableDataset is streamed online; no train tensor cache to save.
+                        pass
                     torch.save(eval_ds.tensors[0], eval_cache_path)
-                    log(f"[INFO] Saved train tokenized cache: {train_cache_path}")
                     log(f"[INFO] Saved eval tokenized cache: {eval_cache_path}")
                 else:
                     if os.path.exists(train_cache_path):
@@ -715,32 +781,59 @@ def main() -> None:
             dist.barrier()
 
         if not is_main_process:
-            train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
+            if args.dataset == "openwebtext" and args.online_train_packing:
+                ds_dict, _ = load_train_data(args)
+                train_hf = ds_dict["train"]
+                train_ds = build_lm_packed_iterable_dataset_from_hf_dataset(
+                    ds=train_hf,
+                    tokenizer=tokenizer,
+                    seq_len=args.seq_len,
+                    max_samples=args.max_train_samples,
+                    tokenize_batch_size=args.tokenize_batch_size,
+                    rank=rank,
+                    world_size=world_size,
+                    seed=args.seed,
+                    estimate_sample_size=args.estimate_sample_size,
+                    shuffle=True,
+                )
+            else:
+                train_ds = TensorDataset(load_cached_input_ids(train_cache_path))
             eval_ds = TensorDataset(load_cached_input_ids(eval_cache_path))
     else:
         if args.dataset == "openwebtext":
-            train_ds, eval_ds = build_openwebtext_train_eval()
+            train_ds, eval_tmp = build_openwebtext_train_eval(build_eval=True)
+            if eval_tmp is None:
+                raise RuntimeError("Internal error: expected openwebtext eval dataset.")
+            eval_ds = eval_tmp
         else:
             train_ds = build_one_dataset(args.train_split, args.max_train_samples, "Train")
             eval_ds = build_one_dataset(args.eval_split, args.max_eval_samples, "Eval")
 
     train_sampler = None
     eval_sampler = None
-    if args.use_fsdp:
+    if args.use_fsdp and not isinstance(train_ds, IterableDataset):
         train_sampler = DistributedSampler(
             train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
         )
+    if args.use_fsdp:
         eval_sampler = DistributedSampler(
             eval_ds, num_replicas=world_size, rank=rank, shuffle=False, seed=args.seed
         )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        drop_last=True,
-    )
+    if isinstance(train_ds, IterableDataset):
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            drop_last=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            drop_last=True,
+        )
     eval_loader = DataLoader(
         eval_ds,
         batch_size=args.eval_batch_size,
@@ -764,7 +857,17 @@ def main() -> None:
             f"wd={g['weight_decay']:.3e} tensors={int(g['num_tensors'])}"
         )
 
-    total_update_steps = math.ceil(len(train_loader) / args.grad_accum_steps) * args.epochs
+    train_loader_len: int | None = None
+    try:
+        train_loader_len = len(train_loader)
+    except Exception:
+        train_loader_len = None
+    if train_loader_len is None:
+        raise RuntimeError(
+            "Unable to infer train loader length for scheduler. "
+            "Set finite max_train_samples or provide an iterable with __len__."
+        )
+    total_update_steps = math.ceil(train_loader_len / args.grad_accum_steps) * args.epochs
     warmup_steps = int(total_update_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
@@ -848,8 +951,11 @@ def main() -> None:
         )
 
     for epoch in range(args.epochs):
+        if hasattr(train_ds, "set_epoch"):
+            train_ds.set_epoch(epoch)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        epoch_forward_steps = 0
 
         pbar = tqdm(
             train_loader,
@@ -859,6 +965,7 @@ def main() -> None:
 
         for step, (input_ids,) in enumerate(pbar, start=1):
             input_ids = input_ids.to(device)
+            epoch_forward_steps += 1
 
             with torch.no_grad():
                 teacher_logits = teacher(input_ids=input_ids).logits
@@ -879,7 +986,7 @@ def main() -> None:
                 reduction="batchmean",
             ) * (args.temperature**2)
 
-            should_step = (step % args.grad_accum_steps == 0) or (step == len(train_loader))
+            should_step = (step % args.grad_accum_steps == 0)
             loss = args.alpha_kd * kd_loss + (1.0 - args.alpha_kd) * ce_loss
             loss = loss / args.grad_accum_steps
 
@@ -964,6 +1071,30 @@ def main() -> None:
                     running_ce = 0.0
                     running_kd = 0.0
                     running_forward_steps = 0
+
+        # Flush remainder gradients at end of epoch when step % grad_accum != 0.
+        pending_steps = epoch_forward_steps % args.grad_accum_steps
+        if pending_steps != 0:
+            if use_deepspeed:
+                student_engine.step()
+            else:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                if sparse_mode:
+                    if args.use_fsdp:
+                        with FSDP.summon_full_params(
+                            mask_target_model,
+                            recurse=True,
+                            writeback=True,
+                        ):
+                            enforce_sparse_masks(mask_target_model, trainable_masks)
+                    else:
+                        enforce_sparse_masks(mask_target_model, trainable_masks)
+            global_step += 1
 
         eval_model = student_engine.module if use_deepspeed else train_model
         eval_loss, eval_ppl = evaluate_causal_lm_loss_and_ppl_from_dataloader(

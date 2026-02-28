@@ -1,18 +1,137 @@
 #!/usr/bin/env python3
 import math
 import re
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from datasets import load_dataset, load_dataset_builder
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, IterableDataset, TensorDataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 
 def loss_to_ppl(loss: float) -> float:
     return math.exp(min(loss, 50.0))
+
+
+class PackedTextIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        hf_dataset: Any,
+        tokenizer: AutoTokenizer,
+        seq_len: int,
+        max_chunks: int,
+        tokenize_batch_size: int,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 42,
+        shuffle: bool = True,
+        estimated_total_chunks: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.hf_dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.seq_len = int(seq_len)
+        self.max_chunks = int(max_chunks)
+        self.tokenize_batch_size = int(tokenize_batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.estimated_total_chunks = (
+            int(estimated_total_chunks) if estimated_total_chunks is not None else None
+        )
+        self.epoch = 0
+
+        if self.seq_len <= 0:
+            raise ValueError("seq_len must be > 0.")
+        if self.tokenize_batch_size <= 0:
+            raise ValueError("tokenize_batch_size must be > 0.")
+        if self.world_size <= 0:
+            raise ValueError("world_size must be > 0.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def estimated_local_chunks(self) -> int:
+        if self.max_chunks > 0:
+            return max(1, math.ceil(self.max_chunks / self.world_size))
+        if self.estimated_total_chunks is not None and self.estimated_total_chunks > 0:
+            return max(1, math.ceil(self.estimated_total_chunks / self.world_size))
+        raise TypeError("Estimated local chunks are unknown for this iterable dataset.")
+
+    def __len__(self) -> int:
+        return self.estimated_local_chunks()
+
+    def __iter__(self):
+        shard_ds = self.hf_dataset.shard(
+            num_shards=self.world_size,
+            index=self.rank,
+            contiguous=False,
+        )
+        if self.shuffle:
+            shard_ds = shard_ds.shuffle(seed=self.seed + self.epoch)
+
+        eos_id = self.tokenizer.eos_token_id
+        target_local_chunks = (
+            math.ceil(self.max_chunks / self.world_size) if self.max_chunks > 0 else None
+        )
+
+        token_pool: list[int] = []
+        token_pool_start = 0
+        produced_chunks = 0
+        text_batch: list[str] = []
+
+        def flush_batch_and_yield():
+            nonlocal token_pool, token_pool_start, produced_chunks, text_batch
+            if not text_batch:
+                return
+            encoded = self.tokenizer(
+                text_batch,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                truncation=False,
+            )
+            text_batch = []
+
+            for ids in encoded["input_ids"]:
+                if not ids:
+                    continue
+                token_pool.extend(ids)
+                if eos_id is not None:
+                    token_pool.append(eos_id)
+
+                while (len(token_pool) - token_pool_start) >= self.seq_len:
+                    chunk = token_pool[token_pool_start : token_pool_start + self.seq_len]
+                    token_pool_start += self.seq_len
+                    produced_chunks += 1
+                    yield torch.tensor(chunk, dtype=torch.long)
+
+                    if target_local_chunks is not None and produced_chunks >= target_local_chunks:
+                        return
+
+                # Compact list occasionally to avoid unbounded prefix growth.
+                if token_pool_start > 500_000:
+                    token_pool = token_pool[token_pool_start:]
+                    token_pool_start = 0
+
+        for row in shard_ds:
+            text = row.get("text") if isinstance(row, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                continue
+            text_batch.append(text)
+            if len(text_batch) >= self.tokenize_batch_size:
+                for item in flush_batch_and_yield():
+                    yield item
+                if target_local_chunks is not None and produced_chunks >= target_local_chunks:
+                    return
+
+        if text_batch:
+            for item in flush_batch_and_yield():
+                yield item
+            if target_local_chunks is not None and produced_chunks >= target_local_chunks:
+                return
 
 
 def _normalize_subset(subset: str | None) -> str | None:
@@ -266,6 +385,96 @@ def build_lm_tensor_dataset_from_hf_dataset(
         tokenize_batch_size=tokenize_batch_size,
         streaming=streaming,
         progress_desc=progress_desc,
+    )
+
+
+def estimate_total_chunks_from_hf_dataset(
+    ds: Any,
+    tokenizer: AutoTokenizer,
+    seq_len: int,
+    sample_size: int = 2048,
+    tokenize_batch_size: int = 512,
+) -> int:
+    if seq_len <= 0:
+        raise ValueError("seq_len must be > 0.")
+    if sample_size <= 0:
+        raise ValueError("sample_size must be > 0.")
+    if tokenize_batch_size <= 0:
+        raise ValueError("tokenize_batch_size must be > 0.")
+
+    total_rows = len(ds)
+    if total_rows <= 0:
+        return 0
+    n = min(total_rows, sample_size)
+
+    # Uniform subsampling by stride to reduce bias from head-only rows.
+    stride = max(1, total_rows // n)
+    indices = list(range(0, total_rows, stride))[:n]
+    eos_id = tokenizer.eos_token_id
+    sampled_tokens = 0
+    sampled_rows = 0
+
+    for start in range(0, len(indices), tokenize_batch_size):
+        batch_idx = indices[start : start + tokenize_batch_size]
+        texts = []
+        for i in batch_idx:
+            text = ds[int(i)]["text"]
+            if isinstance(text, str) and text.strip():
+                texts.append(text)
+        if not texts:
+            continue
+        enc = tokenizer(
+            texts,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            truncation=False,
+        )
+        for ids in enc["input_ids"]:
+            if not ids:
+                continue
+            sampled_tokens += len(ids) + (1 if eos_id is not None else 0)
+            sampled_rows += 1
+
+    if sampled_rows <= 0:
+        return 0
+    avg_tokens_per_row = sampled_tokens / sampled_rows
+    estimated_total_tokens = avg_tokens_per_row * total_rows
+    estimated_total_chunks = int(estimated_total_tokens // seq_len)
+    return max(1, estimated_total_chunks)
+
+
+def build_lm_packed_iterable_dataset_from_hf_dataset(
+    ds: Any,
+    tokenizer: AutoTokenizer,
+    seq_len: int,
+    max_samples: int,
+    tokenize_batch_size: int,
+    rank: int = 0,
+    world_size: int = 1,
+    seed: int = 42,
+    estimate_sample_size: int = 2048,
+    shuffle: bool = True,
+) -> PackedTextIterableDataset:
+    estimated_total_chunks = None
+    if max_samples <= 0:
+        estimated_total_chunks = estimate_total_chunks_from_hf_dataset(
+            ds=ds,
+            tokenizer=tokenizer,
+            seq_len=seq_len,
+            sample_size=estimate_sample_size,
+            tokenize_batch_size=tokenize_batch_size,
+        )
+    return PackedTextIterableDataset(
+        hf_dataset=ds,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        max_chunks=max_samples,
+        tokenize_batch_size=tokenize_batch_size,
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
+        shuffle=shuffle,
+        estimated_total_chunks=estimated_total_chunks,
     )
 
 
