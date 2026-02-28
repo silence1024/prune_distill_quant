@@ -105,25 +105,31 @@ def build_calibration_samples(
     attempts = 0
 
     while len(samples) < nsamples and attempts < max_attempts:
-        attempts += 1
-        idx = rng.randrange(num_rows)
-        text = ds[int(idx)]["text"]
-        if not isinstance(text, str) or not text.strip():
-            continue
+        token_pool: list[int] = []
+        while len(token_pool) < seq_len + 1 and attempts < max_attempts:
+            attempts += 1
+            idx = rng.randrange(num_rows)
+            text = ds[int(idx)]["text"]
+            if not isinstance(text, str) or not text.strip():
+                continue
 
-        token_ids = tokenizer(
-            text,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            truncation=False,
-        )["input_ids"]
-        if eos_id is not None:
-            token_ids = token_ids + [eos_id]
-        if len(token_ids) < seq_len + 1:
-            continue
+            token_ids = tokenizer(
+                text,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                truncation=False,
+            )["input_ids"]
+            if not token_ids:
+                continue
+            token_pool.extend(token_ids)
+            if eos_id is not None:
+                token_pool.append(eos_id)
 
-        start = rng.randint(0, len(token_ids) - seq_len - 1)
-        chunk = torch.tensor(token_ids[start : start + seq_len], dtype=torch.long)
+        if len(token_pool) < seq_len + 1:
+            break
+
+        start = rng.randint(0, len(token_pool) - seq_len - 1)
+        chunk = torch.tensor(token_pool[start : start + seq_len], dtype=torch.long)
         samples.append(chunk.unsqueeze(0))
 
     if len(samples) < nsamples:

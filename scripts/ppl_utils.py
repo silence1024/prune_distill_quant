@@ -23,19 +23,21 @@ def build_lm_tensor_dataset(
     max_samples: int,
     show_progress: bool = True,
     tokenize_batch_size: int = 512,
+    streaming: bool = False,
 ) -> TensorDataset:
     subset_norm = subset
     if subset_norm is not None and str(subset_norm).strip().lower() in {"", "none", "null"}:
         subset_norm = None
     if subset_norm is None:
-        ds = load_dataset(dataset_name, split=split)
+        ds = load_dataset(dataset_name, split=split, streaming=streaming)
     else:
-        ds = load_dataset(dataset_name, subset_norm, split=split)
+        ds = load_dataset(dataset_name, subset_norm, split=split, streaming=streaming)
 
-    if "text" not in ds.column_names:
+    column_names = getattr(ds, "column_names", None) or []
+    if "text" not in column_names:
         raise ValueError(
             f"Dataset `{dataset_name}` split `{split}` has no `text` column. "
-            f"Available columns: {list(ds.column_names)}"
+            f"Available columns: {list(column_names)}"
         )
 
     target_tokens = max_samples * seq_len if max_samples > 0 else None
@@ -45,37 +47,88 @@ def build_lm_tensor_dataset(
     if tokenize_batch_size <= 0:
         raise ValueError("--tokenize_batch_size must be > 0.")
 
-    total_rows = len(ds)
-    row_iter = range(0, total_rows, tokenize_batch_size)
-    pbar = tqdm(
-        row_iter,
-        desc=f"Tokenizing {dataset_name}:{split}",
-        disable=not show_progress,
-    )
-    for start in pbar:
-        end = min(start + tokenize_batch_size, total_rows)
-        batch_texts = ds[start:end]["text"]
-        batch_texts = [t for t in batch_texts if isinstance(t, str) and t.strip()]
-        if not batch_texts:
-            continue
-
-        encoded = tokenizer(
-            batch_texts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            truncation=False,
+    if streaming:
+        processed_chunks = 0
+        pbar = tqdm(
+            total=max_samples if max_samples > 0 else None,
+            desc=f"Tokenizing(stream) {dataset_name}:{split}",
+            disable=not show_progress,
         )
-        for ids in encoded["input_ids"]:
-            if not ids:
-                continue
-            token_buffer.extend(ids)
-            if eos_id is not None:
-                token_buffer.append(eos_id)
+        text_batch: list[str] = []
+        stop = False
 
+        def consume_text_batch(batch: list[str]) -> None:
+            nonlocal processed_chunks, stop
+            if not batch:
+                return
+            encoded = tokenizer(
+                batch,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                truncation=False,
+            )
+            for ids in encoded["input_ids"]:
+                if not ids:
+                    continue
+                token_buffer.extend(ids)
+                if eos_id is not None:
+                    token_buffer.append(eos_id)
+                if target_tokens is not None and len(token_buffer) >= target_tokens:
+                    stop = True
+                    break
+            if max_samples > 0:
+                ready_chunks = min(max_samples, len(token_buffer) // seq_len)
+            else:
+                ready_chunks = len(token_buffer) // seq_len
+            if ready_chunks > processed_chunks:
+                pbar.update(ready_chunks - processed_chunks)
+                processed_chunks = ready_chunks
+
+        for row in ds:
+            text = row.get("text") if isinstance(row, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                continue
+            text_batch.append(text)
+            if len(text_batch) >= tokenize_batch_size:
+                consume_text_batch(text_batch)
+                text_batch = []
+            if stop:
+                break
+        if not stop and text_batch:
+            consume_text_batch(text_batch)
+        pbar.close()
+    else:
+        total_rows = len(ds)
+        row_iter = range(0, total_rows, tokenize_batch_size)
+        pbar = tqdm(
+            row_iter,
+            desc=f"Tokenizing {dataset_name}:{split}",
+            disable=not show_progress,
+        )
+        for start in pbar:
+            end = min(start + tokenize_batch_size, total_rows)
+            batch_texts = ds[start:end]["text"]
+            batch_texts = [t for t in batch_texts if isinstance(t, str) and t.strip()]
+            if not batch_texts:
+                continue
+
+            encoded = tokenizer(
+                batch_texts,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                truncation=False,
+            )
+            for ids in encoded["input_ids"]:
+                if not ids:
+                    continue
+                token_buffer.extend(ids)
+                if eos_id is not None:
+                    token_buffer.append(eos_id)
+
+                if target_tokens is not None and len(token_buffer) >= target_tokens:
+                    break
             if target_tokens is not None and len(token_buffer) >= target_tokens:
                 break
-        if target_tokens is not None and len(token_buffer) >= target_tokens:
-            break
 
     token_count = len(token_buffer)
     num_chunks = token_count // seq_len

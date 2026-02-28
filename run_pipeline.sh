@@ -18,7 +18,7 @@ EMBED_HEAD_LR_RATIO="${EMBED_HEAD_LR_RATIO:-0.2}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.02}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 DTYPE="${DTYPE:-bfloat16}"
-FULL_FINETUNE="${FULL_FINETUNE:-1}"  # 1|0
+FULL_FINETUNE="${FULL_FINETUNE:-0}"  # 1|0
 # Prune dataset options
 PRUNE_CALIB_DATASET="${PRUNE_CALIB_DATASET:-openwebtext}"
 PRUNE_CALIB_SUBSET="${PRUNE_CALIB_SUBSET-none}"
@@ -35,12 +35,15 @@ DISTILL_TRAIN_SPLIT="${DISTILL_TRAIN_SPLIT:-train[:99%]}"
 DISTILL_EVAL_SPLIT="${DISTILL_EVAL_SPLIT:-train[99%:]}"
 DISTILL_MAX_TRAIN_SAMPLES="${DISTILL_MAX_TRAIN_SAMPLES:--1}"
 DISTILL_MAX_EVAL_SAMPLES="${DISTILL_MAX_EVAL_SAMPLES:-400}"
-DISTILL_TOKENIZE_BATCH_SIZE="${DISTILL_TOKENIZE_BATCH_SIZE:-512}"
+DISTILL_TOKENIZE_BATCH_SIZE="${DISTILL_TOKENIZE_BATCH_SIZE:-1024}"
+DISTILL_STREAMING="${DISTILL_STREAMING:-1}"  # 1|0
 DISTILL_BACKEND="${DISTILL_BACKEND:-fsdp}"  # none|deepspeed|fsdp
 DISTILL_LAUNCHER="${DISTILL_LAUNCHER:-torchrun}"  # python|torchrun|accelerate
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-configs/deepspeed_zero2.json}"
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   DEFAULT_NPROC_PER_NODE="$(awk -F',' '{print NF}' <<< "${CUDA_VISIBLE_DEVICES}")"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+  DEFAULT_NPROC_PER_NODE="$(nvidia-smi -L | wc -l | tr -d ' ')"
 else
   DEFAULT_NPROC_PER_NODE="1"
 fi
@@ -54,6 +57,16 @@ WANDB_PROJECT="${WANDB_PROJECT:-prune_dist_quant}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-prune_dist_quant}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 WANDB_MODE="${WANDB_MODE:-online}"  # online|offline|disabled
+
+if [[ "${DISTILL_STREAMING}" == "1" && "${DISTILL_MAX_TRAIN_SAMPLES}" -le 0 ]]; then
+  echo "[WARN] DISTILL_STREAMING=1 with DISTILL_MAX_TRAIN_SAMPLES<=0 means full-corpus tokenization; this may take a long time."
+fi
+
+if [[ "${DISTILL_BACKEND}" == "fsdp" && "${NPROC_PER_NODE}" -le 1 ]]; then
+  echo "[WARN] FSDP requires multi-process launch. Auto fallback to DISTILL_BACKEND=none and DISTILL_LAUNCHER=python."
+  DISTILL_BACKEND="none"
+  DISTILL_LAUNCHER="python"
+fi
 
 PRUNE_DIR="${WORK_DIR}/pruned"
 DISTILL_DIR="${WORK_DIR}/distilled"
@@ -107,6 +120,9 @@ DISTILL_CMD=(
   --dtype "${DTYPE}"
   --sparse_check_eps "${SPARSE_CHECK_EPS}"
 )
+if [[ "${DISTILL_STREAMING}" == "1" ]]; then
+  DISTILL_CMD+=(--dataset_streaming)
+fi
 
 if [[ "${FAIL_ON_SPARSE_VIOLATION}" == "1" ]]; then
   DISTILL_CMD+=(--fail_on_sparse_violation)

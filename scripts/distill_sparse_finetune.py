@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--tokenize_batch_size", type=int, default=512)
     parser.add_argument(
+        "--dataset_streaming",
+        action="store_true",
+        help="Enable HF streaming mode when loading train/eval datasets.",
+    )
+    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=-1,
@@ -524,7 +529,8 @@ def main() -> None:
     log(
         "[INFO] Train dataset config: "
         f"name={args.dataset}, subset={args.dataset_subset}, split={args.train_split}, "
-        f"seq_len={args.seq_len}, max_samples={args.max_train_samples}"
+        f"seq_len={args.seq_len}, max_samples={args.max_train_samples}, "
+        f"streaming={args.dataset_streaming}"
     )
     train_ds = build_lm_tensor_dataset(
         tokenizer=tokenizer,
@@ -535,12 +541,14 @@ def main() -> None:
         max_samples=args.max_train_samples,
         show_progress=is_main_process,
         tokenize_batch_size=args.tokenize_batch_size,
+        streaming=args.dataset_streaming,
     )
     log(f"[INFO] Train tensor dataset size (chunks): {len(train_ds)}")
     log(
         "[INFO] Eval dataset config: "
         f"name={args.dataset}, subset={args.dataset_subset}, split={args.eval_split}, "
-        f"seq_len={args.seq_len}, max_samples={args.max_eval_samples}"
+        f"seq_len={args.seq_len}, max_samples={args.max_eval_samples}, "
+        f"streaming={args.dataset_streaming}"
     )
     eval_ds = build_lm_tensor_dataset(
         tokenizer=tokenizer,
@@ -551,6 +559,7 @@ def main() -> None:
         max_samples=args.max_eval_samples,
         show_progress=is_main_process,
         tokenize_batch_size=args.tokenize_batch_size,
+        streaming=args.dataset_streaming,
     )
     log(f"[INFO] Eval tensor dataset size (chunks): {len(eval_ds)}")
 
